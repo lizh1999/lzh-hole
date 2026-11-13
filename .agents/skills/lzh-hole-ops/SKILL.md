@@ -13,6 +13,8 @@ description: lzh-hole 双机 UDP 直连的部署、升级、配对、launchd 服
 | 访问 | 本地 | `ssh home4`（经跳板，只用于部署、配对、启动和事后取证） |
 | 远端工作目录 | — | `~/Workspace/hole`，不改名 |
 
+在家中同一局域网时，管理连接使用 `ssh home-local`（SSH 配置通过 mDNS 解析）；下文部署命令中的 `home4` 相应替换为 `home-local`。`ssh home` 指向隧道 VIP `10.203.0.2`，不用于需要重启隧道的部署操作。远端目录仍为 `~/Workspace/hole`。运行时发现、候选交换和恢复不依赖 SSH。
+
 两端安装位置相同：
 
 | 路径 | 用途 |
@@ -70,7 +72,8 @@ description: lzh-hole 双机 UDP 直连的部署、升级、配对、launchd 服
 从模板生成 `/etc/lzh-hole/config.toml`，按实际环境修改：
 
 - `management_uid`：管理员 `id -u`。
-- `interface` / `bind_ip`：默认省略，由 daemon 自动选择有公网路由的物理接口并失败轮换；仅在必须固定时填写，填写后不会自动改选。
+- `interface` / `bind_ip`：默认省略，由 daemon 保留有界物理接口/IPv4 socket 集合；LAN 可使用没有公网路由的接口，公网候选按真实出口路由筛选。仅在必须限制接口或地址时填写。
+- `[lan].enabled`：默认 `true`，通过 Bonjour 发现同网段 RFC1918 候选；仍须认证握手和当前路径 PONG 才能上线。旧配置无需增加此节。
 - `stun_seeds`：1 个以上数值公网 IPv4:port，部署前确认可用。
 - `[ntfy].topic`：严格为 `lzh-hole-v1-<relationship_id 的 32 个小写 hex>`。
 - `[ntfy].resolve_ip`：仅在 DNS 把 ntfy 解析成 Fake-IP 时设置一个公网 IPv4。
@@ -116,8 +119,9 @@ sudo rm /usr/local/libexec/lzh-hole   # 仅在确认不再需要时
 
 ## doctor 解读
 
-- `overlay.direct_reachable` / `overlay.currently_healthy`：只有当前 session/endpoint/epoch 匹配的 PONG 才会为 true。
-- `stun`：本端公网映射与服务器状态；全部服务器连续超时会触发 socket 重建。
+- `overlay.direct_reachable` / `overlay.currently_healthy`：只有当前 session/endpoint/transport/epoch 匹配的 PONG 才会为 true。
+- `lan`：Bonjour 发现状态，不等于对端健康；`current_path.kind` 区分 `lan` / `public`，并展示实际接口和双方 endpoint。
+- `stun`：本端公网映射与服务器状态；STUN 超时不重建健康 LAN 连接，物理接口或 socket 失效按 transport 局部处理。
 - `ntfy`：订阅状态、`pacing_reason`、`not_before_unix_ms`。阻塞原因优先于后续 idle/发布失败等现象，等待期间不会发请求。
 - `session`、`tun`、`routes`、`bytes`、`drops`（带原因计数）；未检测项为 `unknown`/`null`。
 - doctor 不含 `functional_pass` 和 `p0_qualified`，必须靠下方外部验收判断。
@@ -126,9 +130,9 @@ sudo rm /usr/local/libexec/lzh-hole   # 仅在确认不再需要时
 
 | 症状 | 检查 |
 |---|---|
-| STUN 发送失败或无映射 | `route -n get -ifscope <ifname> <STUN IP>` 是否有路由；自动模式会轮换候选，固定 `interface` 不会；只剩一个有路由接口时只能 degraded |
-| 0 个对端候选 / 信令不通 | doctor 的 ntfy 状态与 `pacing_reason`；是否在等待限流；DNS 是否返回 Fake-IP（需 `resolve_ip`） |
-| 有候选但不 healthy | 双方 STUN 映射是否同一公网 IP（同出口 NAT 回环未解决，见 `doc/status.md`）；需要抓包时 `sudo tcpdump -ni <ifname> udp port 51000`，须用户确认，取证后停止 |
+| STUN 发送失败或无映射 | 检查 `route -n get -ifscope <ifname> <STUN IP>`；区分公网发现故障和当前 LAN 路径健康状态 |
+| 0 个对端候选 / 信令不通 | LAN 检查 Bonjour、同网段地址和接口限制；公网检查 ntfy 状态、限流与 Fake-IP DNS（必要时 `resolve_ip`） |
+| 有候选但不 healthy | 区分 LAN / 公网候选；同出口公网路径可能受 NAT 回环限制，LAN 检查实际接口和对端地址。需要抓包时 `sudo tcpdump -ni <ifname> udp port 51000`，须用户确认，取证后停止 |
 | ping 不通但 healthy | utun 是否存在、对端 VIP `/32` 路由是否指向本程序 utun、`drops` 原因 |
 
 ## 双端验收
@@ -145,4 +149,4 @@ sudo rm /usr/local/libexec/lzh-hole   # 仅在确认不再需要时
 - TCP：在 VIP 上用 `nc` 双向各传约 64 KiB 随机数据，比较收发长度与 SHA256。
 - UDP：双向各传 512 字节并比较 SHA256。macOS `nc` 会把超过 1024 字节的 UDP 报文截断，不要用大报文判断隧道丢包。
 - 验收前后对比默认路由、DNS（`scutil --dns`）和 plist/config 哈希，确认未变；结束后确认临时监听端口已关闭（`lsof -nP -i :<port>` 无输出）。
-- 区分单进程模拟、双进程 mock 和真实双机公网测试；自有记录读回不等于对端传播时间。
+- 区分单进程模拟、双进程 mock、真实双机 LAN 和真实双机公网测试；LAN 功能通过不等于公网 P0 通过，自有记录读回不等于对端传播时间。

@@ -6,21 +6,24 @@
 //! tests/fixtures/wire-v1.json.
 //!
 //! Bounded by construction: at most 32 pending attempts and 16 responder
-//! entries, 4 KiB per entry, 128 KiB of handshake state in total.
+//! entries, 4 KiB per entry, and 256 authenticated PROBE nonce records, all
+//! charged against 128 KiB of handshake state in total.
 
 use crate::crypto::{
     Key32, LABEL_KDF_CHALLENGE, LABEL_KDF_FINISH, LABEL_KDF_HELLO, LABEL_KDF_KEY_I2R,
     LABEL_KDF_KEY_R2I, LABEL_KDF_SESSION_ID, Prk, extract_prk, frame_mac, info, transcript_hash,
     verify_frame_mac,
 };
-use crate::path::Endpoint;
+use crate::path::{Endpoint, PathEndpoint};
 use crate::replay::ReplayWindow;
 use crate::session::{Session, SessionKeys};
 use crate::wire::{
     AckPayload, ChallengePayload, Direction, FinishPayload, FrameType, Header, HelloPayload,
     ProbePayload, WireError, encode_frame, parse_frame,
 };
-use lzh_hole_types::{BootId, DiscoveryPublicKey, RelationshipId, Role, Roles, Secret32};
+use lzh_hole_types::{
+    BootId, DiscoveryPublicKey, RelationshipId, Role, Roles, Secret32, TransportId,
+};
 
 /// Pending attempts we will track for one relationship.
 pub const MAX_PENDING_ATTEMPTS: usize = 32;
@@ -42,6 +45,9 @@ pub const MAX_RETRANSMITS: u32 = 8;
 pub const REKEY_INTENT_TTL_MS: u64 = 90_000;
 /// Tolerance for a handshake timestamp.
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 120_000;
+/// Authenticated PROBE nonces retained through their entire freshness window.
+/// When full, new probes fail closed rather than evicting live replay evidence.
+pub const MAX_SEEN_PROBES: usize = 256;
 
 /// Why a handshake step did not happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +77,8 @@ pub enum HandshakeReject {
 pub enum HandshakeEvent {
     /// Send these frames to this endpoint.
     Send {
+        /// Physical local socket bound to this handshake.
+        transport: TransportId,
         /// Where to send.
         target: Endpoint,
         /// Complete frames.
@@ -110,6 +118,7 @@ pub struct HandshakeConfig {
 /// One in-flight initiator attempt.
 #[derive(Debug)]
 struct Attempt {
+    transport: TransportId,
     nonce_i: [u8; 32],
     hello: Vec<u8>,
     finish: Option<Vec<u8>>,
@@ -131,6 +140,7 @@ impl Attempt {
 /// One responder-side entry, keyed by the initiator nonce.
 #[derive(Debug)]
 struct ResponderEntry {
+    transport: TransportId,
     nonce_i: [u8; 32],
     nonce_r: [u8; 32],
     hello: Vec<u8>,
@@ -155,6 +165,14 @@ struct RekeyIntent {
     granted_ms: u64,
 }
 
+#[derive(Debug)]
+struct SeenProbe {
+    boot_id: BootId,
+    generation: u64,
+    nonce: [u8; 32],
+    expires_ms: u64,
+}
+
 /// The handshake engine for one relationship.
 pub struct Handshake {
     cfg: HandshakeConfig,
@@ -166,6 +184,8 @@ pub struct Handshake {
     shadow: Vec<Session>,
     rekey: Option<RekeyIntent>,
     handshake_state_bytes: usize,
+    // Pinned relationship/identity, independent of packet source.
+    seen_probes: Vec<SeenProbe>,
 }
 
 impl std::fmt::Debug for Handshake {
@@ -199,6 +219,7 @@ impl Handshake {
             shadow: Vec::new(),
             rekey: None,
             handshake_state_bytes: 0,
+            seen_probes: Vec::new(),
         })
     }
 
@@ -241,6 +262,12 @@ impl Handshake {
         self.attempts.len()
     }
 
+    pub(crate) fn has_attempt_on(&self, transport: TransportId, target: Endpoint) -> bool {
+        self.attempts
+            .iter()
+            .any(|a| a.transport == transport && a.target == target)
+    }
+
     /// Number of responder-side entries.
     pub fn responder_entries(&self) -> usize {
         self.responder.len()
@@ -262,7 +289,8 @@ impl Handshake {
             .iter()
             .map(Attempt::bytes)
             .chain(self.responder.iter().map(ResponderEntry::bytes))
-            .sum();
+            .sum::<usize>()
+            + self.seen_probes.len() * std::mem::size_of::<SeenProbe>();
     }
 
     fn has_room(&self, extra: usize) -> bool {
@@ -271,6 +299,10 @@ impl Handshake {
 
     /// Grant a rekey intent. Bounded to REKEY_INTENT_TTL_MS.
     pub fn grant_rekey_intent(&mut self, now_ms: u64) {
+        // Explicit local authorization starts a separate bounded competition;
+        // ordinary packets cannot clear the already chosen FINISH winner.
+        self.attempts.clear();
+        self.recompute_state_bytes();
         self.rekey = Some(RekeyIntent { granted_ms: now_ms });
     }
 
@@ -283,6 +315,16 @@ impl Handshake {
     /// Start a new initiator attempt against one target.
     pub fn start_attempt(
         &mut self,
+        target: Endpoint,
+        now_ms: u64,
+    ) -> Result<Vec<HandshakeEvent>, HandshakeReject> {
+        self.start_attempt_on(TransportId(0), target, now_ms)
+    }
+
+    /// Start an attempt bound to one local physical transport.
+    pub fn start_attempt_on(
+        &mut self,
+        transport: TransportId,
         target: Endpoint,
         now_ms: u64,
     ) -> Result<Vec<HandshakeEvent>, HandshakeReject> {
@@ -323,6 +365,7 @@ impl Handshake {
         let th1 = transcript_hash(&[hello.as_slice()]);
         let frame = hello.clone();
         self.attempts.push(Attempt {
+            transport,
             nonce_i,
             hello,
             finish: None,
@@ -336,6 +379,7 @@ impl Handshake {
         });
         self.recompute_state_bytes();
         Ok(vec![HandshakeEvent::Send {
+            transport,
             target,
             frames: vec![frame],
         }])
@@ -343,7 +387,17 @@ impl Handshake {
 
     /// Expire stale attempts and produce any due retransmissions.
     pub fn tick(&mut self, now_ms: u64) -> Vec<HandshakeEvent> {
+        self.tick_with_budget(now_ms, |_, _| true)
+    }
+
+    /// Admission precedes retry count/time mutation; deferred work remains due.
+    pub(crate) fn tick_with_budget(
+        &mut self,
+        now_ms: u64,
+        mut admit: impl FnMut(TransportId, Endpoint) -> bool,
+    ) -> Vec<HandshakeEvent> {
         let mut events = Vec::new();
+        self.seen_probes.retain(|p| now_ms <= p.expires_ms);
         let before = self.attempts.len() + self.responder.len();
 
         self.attempts
@@ -373,9 +427,13 @@ impl Handshake {
                 Some(attempt.hello.clone())
             };
             if let Some(frame) = frame {
+                if !admit(attempt.transport, attempt.target) {
+                    continue;
+                }
                 attempt.last_send_ms = now_ms;
                 attempt.sends += 1;
                 events.push(HandshakeEvent::Send {
+                    transport: attempt.transport,
                     target: attempt.target,
                     frames: vec![frame],
                 });
@@ -400,6 +458,17 @@ impl Handshake {
         source: Endpoint,
         now_ms: u64,
     ) -> Vec<HandshakeEvent> {
+        self.handle_frame_on(TransportId(0), datagram, source, now_ms)
+    }
+
+    /// Receive a frame on its actual retained local socket.
+    pub fn handle_frame_on(
+        &mut self,
+        transport: TransportId,
+        datagram: &[u8],
+        source: Endpoint,
+        now_ms: u64,
+    ) -> Vec<HandshakeEvent> {
         let parsed = match parse_frame(datagram) {
             Ok(p) => p,
             Err(e) => return vec![HandshakeEvent::Dropped(HandshakeReject::Wire(e))],
@@ -408,10 +477,12 @@ impl Handshake {
             return vec![HandshakeEvent::Dropped(HandshakeReject::WrongRelationship)];
         }
         match parsed.header.frame_type {
-            FrameType::Hello => self.handle_hello(datagram, &parsed, source, now_ms),
-            FrameType::Challenge => self.handle_challenge(datagram, &parsed, now_ms),
-            FrameType::Finish => self.handle_finish(datagram, &parsed, source, now_ms),
-            FrameType::Ack => self.handle_ack(&parsed, now_ms),
+            FrameType::Hello => self.handle_hello(datagram, &parsed, transport, source, now_ms),
+            FrameType::Challenge => {
+                self.handle_challenge(datagram, &parsed, transport, source, now_ms)
+            }
+            FrameType::Finish => self.handle_finish(datagram, &parsed, transport, source, now_ms),
+            FrameType::Ack => self.handle_ack(&parsed, transport, source, now_ms),
             FrameType::Probe => self.handle_probe(&parsed, now_ms),
             _ => vec![HandshakeEvent::Dropped(HandshakeReject::NoMatchingAttempt)],
         }
@@ -443,6 +514,31 @@ impl Handshake {
         if !Self::fresh_enough(probe.issued_at_unix_ms, now_ms) {
             return vec![HandshakeEvent::Dropped(HandshakeReject::ClockSkew)];
         }
+        self.seen_probes.retain(|p| now_ms <= p.expires_ms);
+        self.recompute_state_bytes();
+        if self.seen_probes.iter().any(|p| {
+            p.boot_id == probe.boot_id
+                && p.generation == probe.generation
+                && p.nonce == probe.probe_nonce
+        }) {
+            return vec![HandshakeEvent::Dropped(HandshakeReject::NoMatchingAttempt)];
+        }
+        if self.seen_probes.len() >= MAX_SEEN_PROBES
+            || !self.has_room(std::mem::size_of::<SeenProbe>())
+        {
+            return vec![HandshakeEvent::Dropped(HandshakeReject::TableFull(
+                "seen_probes",
+            ))];
+        }
+        self.seen_probes.push(SeenProbe {
+            boot_id: probe.boot_id,
+            generation: probe.generation,
+            nonce: probe.probe_nonce,
+            expires_ms: probe
+                .issued_at_unix_ms
+                .saturating_add(CLOCK_SKEW_TOLERANCE_MS),
+        });
+        self.recompute_state_bytes();
         Vec::new()
     }
 
@@ -450,6 +546,7 @@ impl Handshake {
         &mut self,
         datagram: &[u8],
         parsed: &crate::wire::ParsedFrame<'_>,
+        transport: TransportId,
         source: Endpoint,
         now_ms: u64,
     ) -> Vec<HandshakeEvent> {
@@ -483,6 +580,9 @@ impl Handshake {
             .iter_mut()
             .find(|e| e.nonce_i == hello.nonce_i && e.hello.as_slice() == datagram)
         {
+            if entry.transport != transport || entry.source != source {
+                return vec![HandshakeEvent::Dropped(HandshakeReject::NoMatchingAttempt)];
+            }
             if now_ms.saturating_sub(entry.last_send_ms) >= RETRANSMIT_INTERVAL_MS
                 && entry.sends < MAX_RETRANSMITS
             {
@@ -490,6 +590,7 @@ impl Handshake {
                 entry.sends += 1;
                 let frame = entry.ack.clone().unwrap_or_else(|| entry.challenge.clone());
                 return vec![HandshakeEvent::Send {
+                    transport,
                     target: entry.source,
                     frames: vec![frame],
                 }];
@@ -547,6 +648,7 @@ impl Handshake {
         };
         let frame = challenge.clone();
         self.responder.push(ResponderEntry {
+            transport,
             nonce_i: hello.nonce_i,
             nonce_r,
             hello: datagram.to_vec(),
@@ -560,6 +662,7 @@ impl Handshake {
         });
         self.recompute_state_bytes();
         vec![HandshakeEvent::Send {
+            transport,
             target: source,
             frames: vec![frame],
         }]
@@ -569,6 +672,8 @@ impl Handshake {
         &mut self,
         datagram: &[u8],
         parsed: &crate::wire::ParsedFrame<'_>,
+        transport: TransportId,
+        source: Endpoint,
         now_ms: u64,
     ) -> Vec<HandshakeEvent> {
         if self.role != Role::Initiator {
@@ -590,6 +695,16 @@ impl Handshake {
             return vec![HandshakeEvent::Dropped(HandshakeReject::NoMatchingAttempt)];
         };
         let expected_th1 = self.attempts[idx].th1;
+        if self.attempts[idx].transport != transport || self.attempts[idx].target != source {
+            return vec![HandshakeEvent::Dropped(HandshakeReject::NoMatchingAttempt)];
+        }
+        // Once FINISH has selected a transcript, no other path may create a
+        // competing session. Keep only the winning attempt after authentication.
+        if self.attempts.iter().any(|a| a.awaiting_ack) && !self.attempts[idx].awaiting_ack {
+            return vec![HandshakeEvent::Dropped(
+                HandshakeReject::WouldPreemptHealthySession,
+            )];
+        }
         if challenge.th1 != expected_th1 {
             return vec![HandshakeEvent::Dropped(HandshakeReject::NoMatchingAttempt)];
         }
@@ -622,6 +737,7 @@ impl Handshake {
                 attempt.last_send_ms = now_ms;
                 attempt.sends += 1;
                 return vec![HandshakeEvent::Send {
+                    transport,
                     target: attempt.target,
                     frames: vec![existing],
                 }];
@@ -707,9 +823,13 @@ impl Handshake {
         let session_id = session.keys.session_id;
         self.install_session(session, now_ms, false);
 
+        let target = self.attempts[idx].target;
+        self.attempts.retain(|a| a.nonce_i == challenge.nonce_i);
+        self.recompute_state_bytes();
         vec![
             HandshakeEvent::Send {
-                target: self.attempts[idx].target,
+                transport,
+                target,
                 frames: vec![finish],
             },
             HandshakeEvent::SessionInstalled { session_id },
@@ -720,6 +840,7 @@ impl Handshake {
         &mut self,
         datagram: &[u8],
         parsed: &crate::wire::ParsedFrame<'_>,
+        transport: TransportId,
         source: Endpoint,
         now_ms: u64,
     ) -> Vec<HandshakeEvent> {
@@ -745,6 +866,9 @@ impl Handshake {
             self.responder[idx].hello.as_slice(),
             self.responder[idx].challenge.as_slice(),
         ]);
+        if self.responder[idx].transport != transport || self.responder[idx].source != source {
+            return vec![HandshakeEvent::Dropped(HandshakeReject::NoMatchingAttempt)];
+        }
         if finish.th1 != transcript_hash(&[self.responder[idx].hello.as_slice()])
             || finish.th2 != expected_th2
         {
@@ -797,6 +921,7 @@ impl Handshake {
                     entry.last_send_ms = now_ms;
                     entry.sends += 1;
                     return vec![HandshakeEvent::Send {
+                        transport,
                         target: source,
                         frames: vec![existing],
                     }];
@@ -851,6 +976,7 @@ impl Handshake {
 
         vec![
             HandshakeEvent::Send {
+                transport,
                 target: source,
                 frames: vec![ack],
             },
@@ -861,6 +987,8 @@ impl Handshake {
     fn handle_ack(
         &mut self,
         parsed: &crate::wire::ParsedFrame<'_>,
+        transport: TransportId,
+        source: Endpoint,
         now_ms: u64,
     ) -> Vec<HandshakeEvent> {
         if self.role != Role::Initiator {
@@ -877,6 +1005,13 @@ impl Handshake {
         let Some(session) = self.session.as_ref() else {
             return vec![HandshakeEvent::Dropped(HandshakeReject::NoMatchingAttempt)];
         };
+        if !self
+            .attempts
+            .iter()
+            .any(|a| a.awaiting_ack && a.transport == transport && a.target == source)
+        {
+            return vec![HandshakeEvent::Dropped(HandshakeReject::NoMatchingAttempt)];
+        }
         if !verify_frame_mac(
             session.keys.rx_key(self.role),
             &parsed.raw_header(),
@@ -989,6 +1124,35 @@ impl Handshake {
     /// Number of shadow sessions held.
     pub fn shadow_len(&self) -> usize {
         self.shadow.len()
+    }
+
+    /// Forget pending work on a socket that will never be used again.
+    pub fn remove_transport(&mut self, transport: TransportId) {
+        self.attempts.retain(|a| a.transport != transport);
+        self.responder.retain(|e| e.transport != transport);
+        self.recompute_state_bytes();
+    }
+
+    pub(crate) fn pending_paths(&self) -> Vec<PathEndpoint> {
+        self.attempts
+            .iter()
+            .map(|a| PathEndpoint {
+                transport: a.transport,
+                remote: a.target,
+            })
+            .chain(self.responder.iter().map(|e| PathEndpoint {
+                transport: e.transport,
+                remote: e.source,
+            }))
+            .collect()
+    }
+
+    pub(crate) fn remove_path(&mut self, path: PathEndpoint) {
+        self.attempts
+            .retain(|a| a.transport != path.transport || a.target != path.remote);
+        self.responder
+            .retain(|e| e.transport != path.transport || e.source != path.remote);
+        self.recompute_state_bytes();
     }
 
     /// MAC a frame we are about to send under the current session.

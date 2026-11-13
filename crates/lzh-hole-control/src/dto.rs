@@ -138,6 +138,56 @@ pub struct OverlayHealth {
     pub detail: Option<String>,
 }
 
+/// Discovery origin, not authenticated connectivity evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryOrigin {
+    /// Interface-scoped Bonjour observation.
+    Lan,
+    /// Verified public coordination record.
+    Public,
+}
+
+/// Selected direct path, populated only from the protocol engine's actual path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentPathStatus {
+    /// Process-local, never-reused physical socket identifier.
+    pub transport_id: u64,
+    /// Actual bound physical interface name.
+    pub interface: String,
+    /// Actual bound IPv4 UDP endpoint.
+    pub local_endpoint: String,
+    /// Authenticated remote IPv4 UDP endpoint.
+    pub remote_endpoint: String,
+    /// LAN or public path policy.
+    pub kind: DiscoveryOrigin,
+}
+
+/// One eligible transport-bound discovery hint; never proof of peer health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateStatus {
+    /// Backend that supplied the hint.
+    pub origin: DiscoveryOrigin,
+    /// Physical socket on which this candidate may be attempted.
+    pub transport_id: u64,
+    /// Candidate remote IPv4 UDP endpoint.
+    pub remote_endpoint: String,
+}
+
+/// Bounded discovery accounting, independent of actual session health.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryCounters {
+    /// Accepted normalized discovery updates.
+    pub accepted_updates: u64,
+    /// Rejected or capacity-limited discovery updates.
+    pub rejected_updates: u64,
+    /// Source-specific withdrawals, including expiry.
+    pub withdrawals: u64,
+}
+
 /// Fresh doctor data returned to the local management client.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +196,8 @@ pub struct ServiceSnapshot {
     pub daemon: DaemonStatus,
     /// Latest ntfy observation.
     pub ntfy: ComponentStatus,
+    /// Latest local Bonjour discovery observation; not peer health.
+    pub lan: ComponentStatus,
     /// Latest STUN observation on the physical data socket.
     pub stun: ComponentStatus,
     /// Latest authenticated peer session observation.
@@ -160,6 +212,12 @@ pub struct ServiceSnapshot {
     pub drops: DropCounters,
     /// End-to-end direct-path evidence, independent of daemon Running.
     pub overlay: OverlayHealth,
+    /// Current selected path, including its real physical socket.
+    pub current_path: Option<CurrentPathStatus>,
+    /// At most 32 eligible transport-bound candidates, not online evidence.
+    pub candidates: Vec<CandidateStatus>,
+    /// Truthful backend update accounting.
+    pub discovery: DiscoveryCounters,
     /// Timestamp of the latest snapshot update, zero if not supplied.
     pub updated_unix_ms: u64,
 }

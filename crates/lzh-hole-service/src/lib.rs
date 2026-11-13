@@ -5,5 +5,7 @@
 mod config;
 mod daemon;
 
-pub use config::{ConfigError, NtfyConfig as FileNtfyConfig, ResolvedConfig, ServiceConfig};
+pub use config::{
+    ConfigError, LanConfig, NtfyConfig as FileNtfyConfig, ResolvedConfig, ServiceConfig,
+};
 pub use daemon::{DaemonError, doctor, run};

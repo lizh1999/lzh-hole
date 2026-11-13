@@ -13,7 +13,73 @@ use std::fmt;
 use std::net::Ipv4Addr;
 
 pub use lzh_hole_types::Endpoint;
+use lzh_hole_types::TransportId;
 use serde::{Deserialize, Serialize};
+
+/// A remote endpoint reached through one retained local physical socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PathEndpoint {
+    /// Opaque local socket identity.
+    pub transport: TransportId,
+    /// Actual remote UDP address.
+    pub remote: Endpoint,
+}
+
+/// Discovery provenance; neither class is authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    /// Untrusted on-link RFC1918 hint.
+    Lan,
+    /// Existing public discovery.
+    Public,
+}
+
+/// A discovery hint associated with its physical transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathCandidate {
+    /// Local transport and remote endpoint.
+    pub path: PathEndpoint,
+    /// Address policy to apply.
+    pub kind: PathKind,
+}
+
+/// An IPv4 subnet actually attached to a physical interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanSubnet {
+    /// Interface address (host bits need not be zero).
+    pub address: Ipv4Addr,
+    /// CIDR prefix length.
+    pub prefix_len: u8,
+}
+
+impl LanSubnet {
+    /// Whether this is an on-link RFC1918 host, excluding network/broadcast.
+    pub fn contains_host(&self, address: Ipv4Addr) -> bool {
+        if !(1..=30).contains(&self.prefix_len) || !is_private(self.address) || !is_private(address)
+        {
+            return false;
+        }
+        let mask = u32::MAX << (32 - self.prefix_len);
+        let network = u32::from(self.address) & mask;
+        // A broad/malformed subnet must not authorize another private block.
+        if !is_private(Ipv4Addr::from(network)) || !is_private(Ipv4Addr::from(network | !mask)) {
+            return false;
+        }
+        let host = u32::from(address);
+        host & mask == network && host != network && host != network | !mask
+    }
+}
+
+/// Trusted local facts supplied by the socket owner, never by discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportPolicy {
+    /// Daemon-lifetime unique socket identity.
+    pub transport: TransportId,
+    /// Bound physical address and port.
+    pub local_endpoint: Endpoint,
+    /// Physical interface's attached IPv4 subnets.
+    pub lan_subnets: Vec<LanSubnet>,
+}
 
 /// How a candidate was learned.
 ///

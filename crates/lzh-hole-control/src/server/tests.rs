@@ -36,15 +36,30 @@ fn default_snapshot_does_not_claim_networking_or_external_acceptance() {
     let snapshot = ServiceSnapshot::default();
     assert_eq!(snapshot.daemon.state, DaemonState::Unknown);
     assert_eq!(snapshot.ntfy.state, ComponentState::Unknown);
+    assert_eq!(snapshot.lan.state, ComponentState::Unknown);
     assert_eq!(snapshot.stun.state, ComponentState::Unknown);
     assert_eq!(snapshot.session.state, ComponentState::Unknown);
     assert_eq!(snapshot.tun.state, ComponentState::Unknown);
     assert_eq!(snapshot.routes.state, ComponentState::Unknown);
     assert_eq!(snapshot.overlay.direct_reachable, None);
     assert_eq!(snapshot.overlay.currently_healthy, None);
+    assert!(snapshot.current_path.is_none());
+    assert!(snapshot.candidates.is_empty());
     let json = serde_json::to_string(&snapshot).unwrap();
     assert!(!json.contains("functional_pass"));
     assert!(!json.contains("p0_qualified"));
+}
+
+#[test]
+fn additive_doctor_fields_remain_strict_and_round_trip() {
+    let snapshot = ServiceSnapshot::default();
+    let mut value = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ServiceSnapshot>(value.clone()).unwrap(),
+        snapshot,
+    );
+    value["discovery"]["unknown"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<ServiceSnapshot>(value).is_err());
 }
 
 #[test]

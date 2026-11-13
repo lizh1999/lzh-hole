@@ -495,4 +495,721 @@ mod tests {
         assert!(pair.b.next_ipv4_packet().is_none());
         assert_eq!(pair.b.hs.session().expect("session").rx.highest(), highest);
     }
+
+    use crate::path::{LanSubnet, PathCandidate, PathEndpoint, PathKind, TransportPolicy};
+    use lzh_hole_types::TransportId;
+
+    fn lan_endpoint(host: u8) -> Endpoint {
+        Endpoint::new(Ipv4Addr::new(192, 168, 7, host), 42000)
+    }
+    fn lan_policy(id: u64, host: u8) -> TransportPolicy {
+        TransportPolicy {
+            transport: TransportId(id),
+            local_endpoint: lan_endpoint(host),
+            lan_subnets: vec![LanSubnet {
+                address: lan_endpoint(host).ip,
+                prefix_len: 24,
+            }],
+        }
+    }
+    fn lan_candidate(id: u64, host: u8) -> PathCandidate {
+        PathCandidate {
+            path: PathEndpoint {
+                transport: TransportId(id),
+                remote: lan_endpoint(host),
+            },
+            kind: PathKind::Lan,
+        }
+    }
+    fn lan_pair() -> Pair {
+        let mut pair = pair();
+        pair.a_endpoint = lan_endpoint(1);
+        pair.b_endpoint = lan_endpoint(2);
+        pair.a
+            .set_transports(&[lan_policy(11, 1), lan_policy(12, 3)]);
+        pair.b
+            .set_transports(&[lan_policy(21, 2), lan_policy(22, 4)]);
+        pair.a.set_paths(&[lan_candidate(11, 2)]);
+        pair.b.set_paths(&[lan_candidate(21, 1)]);
+        pair
+    }
+    fn pump_lan(pair: &mut Pair, now: u64) {
+        for _ in 0..32 {
+            let mut progress = false;
+            while let Some(frame) = pair.a.next_udp_frame() {
+                assert_eq!(frame.transport, TransportId(11));
+                assert_eq!(frame.target, pair.b_endpoint);
+                pair.b
+                    .handle_datagram_on(TransportId(21), pair.a_endpoint, &frame.bytes, now);
+                progress = true;
+            }
+            while let Some(frame) = pair.b.next_udp_frame() {
+                assert_eq!(frame.transport, TransportId(21));
+                assert_eq!(frame.target, pair.a_endpoint);
+                pair.a
+                    .handle_datagram_on(TransportId(11), pair.b_endpoint, &frame.bytes, now);
+                progress = true;
+            }
+            if !progress {
+                return;
+            }
+        }
+        panic!("LAN queue did not converge");
+    }
+    fn establish_lan(pair: &mut Pair) -> u64 {
+        for step in 0..200 {
+            let now = START + step * 50;
+            pair.a.tick(now);
+            pair.b.tick(now);
+            pump_lan(pair, now);
+            if pair.a.snapshot(now).currently_healthy && pair.b.snapshot(now).currently_healthy {
+                return now;
+            }
+        }
+        panic!(
+            "LAN pair not healthy: {:?} {:?}",
+            pair.a.snapshot(START),
+            pair.b.snapshot(START)
+        );
+    }
+
+    #[test]
+    fn lan_handshake_data_withdrawal_and_transport_removal() {
+        let mut pair = lan_pair();
+        let now = establish_lan(&mut pair);
+        assert_eq!(
+            pair.a.snapshot(now).selected_path,
+            Some(lan_candidate(11, 2).path)
+        );
+        let packet = ipv4(A_VIP, B_VIP, 24, 0);
+        pair.a.set_paths(&[]);
+        assert!(pair.a.snapshot(now).currently_healthy);
+        pair.a.send_ipv4(&packet, now).unwrap();
+        pump_lan(&mut pair, now);
+        assert_eq!(pair.b.next_ipv4_packet(), Some(packet));
+        pair.a.set_paths(&[lan_candidate(12, 2)]);
+        pair.a.remove_transport(TransportId(11));
+        assert_eq!(pair.a.snapshot(now).selected_path, None);
+        assert_eq!(pair.a.snapshot(now).candidate_count, 1);
+        assert!(pair.a.next_udp_frame().is_none());
+        pair.b.send_ipv4(&ipv4(B_VIP, A_VIP, 0, 0), now).unwrap();
+        let stale = pair.b.next_udp_frame().unwrap();
+        pair.a
+            .handle_datagram_on(TransportId(11), pair.b_endpoint, &stale.bytes, now);
+        assert!(pair.a.next_ipv4_packet().is_none());
+        assert_eq!(pair.a.snapshot(now).session_id, None);
+    }
+    #[test]
+    fn lan_policy_is_strict_even_when_legacy_test_filter_is_disabled() {
+        let mut pair = lan_pair();
+        let mut candidates = vec![lan_candidate(11, 2)];
+        for host in [0, 1, 3, 255] {
+            candidates.push(lan_candidate(11, host));
+        }
+        for ip in [
+            "192.168.8.2",
+            "10.203.0.1",
+            "10.203.0.2",
+            "198.18.0.1",
+            "127.0.0.1",
+            "8.8.8.8",
+        ] {
+            let mut candidate = lan_candidate(11, 2);
+            candidate.path.remote.ip = ip.parse().unwrap();
+            candidates.push(candidate);
+        }
+        candidates.push(lan_candidate(999, 2));
+        let mut public = lan_candidate(11, 2);
+        public.kind = PathKind::Public;
+        candidates.push(public);
+        let update = pair.a.set_paths(&candidates);
+        assert_eq!(update.accepted, 1);
+        assert_eq!(update.rejected, candidates.len() - 1);
+        public.path.remote.ip = "8.8.8.8".parse().unwrap();
+        assert_eq!(pair.a.set_paths(&[public]).accepted, 1);
+    }
+    #[test]
+    fn unchanged_candidates_preserve_probe_timers() {
+        let mut pair = lan_pair();
+        pair.b.tick(START);
+        while pair.b.next_udp_frame().is_some() {}
+        assert_eq!(pair.b.candidates[0].last_probe_ms, Some(START));
+        pair.b.set_paths(&[lan_candidate(21, 1)]);
+        assert_eq!(pair.b.candidates[0].last_probe_ms, Some(START));
+        pair.b.tick(START + 1);
+        assert!(pair.b.next_udp_frame().is_none());
+    }
+    #[test]
+    fn wrong_local_transport_cannot_accept_challenge_or_consume_pong() {
+        let mut pair = lan_pair();
+        pair.a.tick(START);
+        let hello = pair.a.next_udp_frame().unwrap();
+        pair.b
+            .handle_datagram_on(TransportId(21), pair.a_endpoint, &hello.bytes, START);
+        let challenge = pair.b.next_udp_frame().unwrap();
+        pair.a
+            .handle_datagram_on(TransportId(12), pair.b_endpoint, &challenge.bytes, START);
+        assert_eq!(pair.a.snapshot(START).session_id, None);
+        assert!(pair.a.next_udp_frame().is_none());
+        pair.a
+            .handle_datagram_on(TransportId(11), pair.b_endpoint, &challenge.bytes, START);
+        pump_lan(&mut pair, START);
+        let now = establish_lan(&mut pair);
+        while pair.a.next_udp_frame().is_some() {}
+        while pair.b.next_udp_frame().is_some() {}
+        pair.a.tick(now + 6_000);
+        while let Some(ping) = pair.a.next_udp_frame() {
+            pair.b
+                .handle_datagram_on(TransportId(21), pair.a_endpoint, &ping.bytes, now + 6_000);
+        }
+        let pong = std::iter::from_fn(|| pair.b.next_udp_frame())
+            .find(|frame| {
+                parse_frame(&frame.bytes).unwrap().header.frame_type == FrameType::CtrlPong
+            })
+            .expect("health PONG");
+        let highest = pair.a.hs.session().unwrap().rx.highest();
+        let trips = pair.a.snapshot(now + 6_000).round_trips;
+        pair.a
+            .handle_datagram_on(TransportId(12), pair.b_endpoint, &pong.bytes, now + 6_000);
+        assert_eq!(pair.a.hs.session().unwrap().rx.highest(), highest);
+        assert_eq!(pair.a.snapshot(now + 6_000).round_trips, trips);
+        pair.a
+            .handle_datagram_on(TransportId(11), pair.b_endpoint, &pong.bytes, now + 6_000);
+        assert_eq!(pair.a.snapshot(now + 6_000).round_trips, trips + 1);
+    }
+    #[test]
+    fn multiple_paths_choose_exactly_one_finish_transcript() {
+        let mut pair = lan_pair();
+        pair.a
+            .set_paths(&[lan_candidate(11, 2), lan_candidate(12, 2)]);
+        pair.a.tick(START);
+        let first = pair.a.next_udp_frame().unwrap();
+        let second = pair.a.next_udp_frame().unwrap();
+        pair.b
+            .handle_datagram_on(TransportId(21), pair.a_endpoint, &first.bytes, START);
+        let challenge1 = pair.b.next_udp_frame().unwrap();
+        pair.b
+            .handle_datagram_on(TransportId(22), lan_endpoint(3), &second.bytes, START);
+        let challenge2 = pair.b.next_udp_frame().unwrap();
+        pair.a
+            .handle_datagram_on(first.transport, pair.b_endpoint, &challenge1.bytes, START);
+        let winner = pair.a.snapshot(START).session_id;
+        pair.a
+            .handle_datagram_on(second.transport, pair.b_endpoint, &challenge2.bytes, START);
+        assert_eq!(pair.a.snapshot(START).session_id, winner);
+        let mut finishes = 0;
+        while let Some(frame) = pair.a.next_udp_frame() {
+            if parse_frame(&frame.bytes).unwrap().header.frame_type == FrameType::Finish {
+                finishes += 1;
+                assert_eq!(frame.transport, first.transport);
+            }
+        }
+        assert_eq!(finishes, 1);
+        assert_eq!(pair.a.hs.shadow_len(), 0);
+    }
+    #[test]
+    fn control_probe_budget_is_bounded_without_throttling_data() {
+        let mut pair = lan_pair();
+        let now = establish_lan(&mut pair) + 1_000;
+        while pair.a.next_udp_frame().is_some() {}
+        let path = lan_candidate(11, 2).path;
+        for _ in 0..20 {
+            pair.a.send_responder_probe(path, now);
+        }
+        assert_eq!(pair.a.snapshot(now).queued_udp_frames, 2);
+        for _ in 0..12 {
+            pair.a.send_ipv4(&ipv4(A_VIP, B_VIP, 0, 0), now).unwrap();
+        }
+        assert_eq!(pair.a.snapshot(now).queued_udp_frames, 14);
+        let mut budget = super::super::ProbeBudget::default();
+        for host in 2..12 {
+            assert!(budget.allow(lan_candidate(11, host).path, now));
+        }
+        assert!(!budget.allow(lan_candidate(11, 13).path, now));
+        assert!(budget.allow(path, now + 1_000));
+    }
+    #[test]
+    fn authenticated_probe_seeds_one_sided_discovery_without_duplicates() {
+        let mut pair = lan_pair();
+        pair.a.set_paths(&[]);
+        pair.b.tick(START);
+        let probe = pair.b.next_udp_frame().unwrap();
+        let mut corrupt = probe.bytes.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        pair.a
+            .handle_datagram_on(TransportId(11), pair.b_endpoint, &corrupt, START);
+        assert_eq!(pair.a.snapshot(START).candidate_count, 0);
+        for _ in 0..20 {
+            pair.a
+                .handle_datagram_on(TransportId(11), pair.b_endpoint, &probe.bytes, START);
+        }
+        assert_eq!(pair.a.snapshot(START).candidate_count, 1);
+        assert!(pair.a.next_udp_frame().is_none());
+        establish_lan(&mut pair);
+    }
+    #[test]
+    fn sessionless_policy_and_finish_are_bound_to_actual_transport() {
+        let mut pair = lan_pair();
+        pair.a.tick(START);
+        let hello = pair.a.next_udp_frame().unwrap();
+        for source in [
+            lan_endpoint(0),
+            lan_endpoint(255),
+            lan_endpoint(2),
+            Endpoint::new(A_VIP, 42),
+        ] {
+            pair.b
+                .handle_datagram_on(TransportId(21), source, &hello.bytes, START);
+            assert!(pair.b.next_udp_frame().is_none());
+        }
+        pair.b
+            .handle_datagram_on(TransportId(999), pair.a_endpoint, &hello.bytes, START);
+        assert!(pair.b.next_udp_frame().is_none());
+        pair.b
+            .handle_datagram_on(TransportId(21), pair.a_endpoint, &hello.bytes, START);
+        let challenge = pair.b.next_udp_frame().unwrap();
+        pair.a
+            .handle_datagram_on(TransportId(11), pair.b_endpoint, &challenge.bytes, START);
+        let finish = pair.a.next_udp_frame().unwrap();
+        assert_eq!(
+            parse_frame(&finish.bytes).unwrap().header.frame_type,
+            FrameType::Finish
+        );
+        pair.b
+            .handle_datagram_on(TransportId(22), pair.a_endpoint, &finish.bytes, START);
+        assert_eq!(pair.b.snapshot(START).session_id, None);
+        assert!(pair.b.next_udp_frame().is_none());
+        pair.b
+            .handle_datagram_on(TransportId(21), pair.a_endpoint, &finish.bytes, START);
+        assert!(pair.b.snapshot(START).session_id.is_some());
+    }
+    fn public_endpoint(from_a: bool) -> Endpoint {
+        Endpoint::new(
+            if from_a {
+                Ipv4Addr::new(8, 8, 8, 1)
+            } else {
+                Ipv4Addr::new(9, 9, 9, 2)
+            },
+            42000,
+        )
+    }
+    fn public_candidate(from_a: bool) -> PathCandidate {
+        PathCandidate {
+            path: PathEndpoint {
+                transport: TransportId(if from_a { 12 } else { 22 }),
+                remote: public_endpoint(!from_a),
+            },
+            kind: PathKind::Public,
+        }
+    }
+    fn deliver_dual(pair: &mut Pair, from_a: bool, frame: crate::engine::UdpFrame, now: u64) {
+        let lan = frame.transport == TransportId(if from_a { 11 } else { 21 });
+        assert_eq!(
+            frame.transport,
+            TransportId(if from_a {
+                if lan { 11 } else { 12 }
+            } else if lan {
+                21
+            } else {
+                22
+            })
+        );
+        let source = if lan {
+            if from_a {
+                pair.a_endpoint
+            } else {
+                pair.b_endpoint
+            }
+        } else {
+            public_endpoint(from_a)
+        };
+        assert_eq!(
+            frame.target,
+            if lan {
+                if from_a {
+                    pair.b_endpoint
+                } else {
+                    pair.a_endpoint
+                }
+            } else {
+                public_endpoint(!from_a)
+            }
+        );
+        let receiver = if from_a { &mut pair.b } else { &mut pair.a };
+        receiver.handle_datagram_on(
+            TransportId(if from_a {
+                if lan { 21 } else { 22 }
+            } else if lan {
+                11
+            } else {
+                12
+            }),
+            source,
+            &frame.bytes,
+            now,
+        );
+    }
+    fn pump_dual(pair: &mut Pair, now: u64) {
+        for _ in 0..32 {
+            let mut progress = false;
+            while let Some(frame) = pair.a.next_udp_frame() {
+                deliver_dual(pair, true, frame, now);
+                progress = true;
+            }
+            while let Some(frame) = pair.b.next_udp_frame() {
+                deliver_dual(pair, false, frame, now);
+                progress = true;
+            }
+            if !progress {
+                return;
+            }
+        }
+        panic!("dual-path queue did not converge");
+    }
+    #[test]
+    fn reordered_dual_lan_public_paths_verify_only_the_reciprocal_handshake_winner() {
+        for lan_wins in [true, false] {
+            let mut pair = lan_pair();
+            let a_lan = lan_candidate(11, 2);
+            let b_lan = lan_candidate(21, 1);
+            pair.a.set_paths(&[public_candidate(true), a_lan]);
+            pair.b.set_paths(&[b_lan, public_candidate(false)]);
+            pair.a.tick(START);
+            let hellos = std::iter::from_fn(|| pair.a.next_udp_frame()).collect::<Vec<_>>();
+            assert_eq!(hellos.len(), 2);
+            for hello in hellos {
+                deliver_dual(&mut pair, true, hello, START);
+            }
+            let mut challenges = std::iter::from_fn(|| pair.b.next_udp_frame()).collect::<Vec<_>>();
+            assert_eq!(challenges.len(), 2);
+            let winning_b = TransportId(if lan_wins { 21 } else { 22 });
+            let winner_index = challenges
+                .iter()
+                .position(|f| f.transport == winning_b)
+                .unwrap();
+            let winning_challenge = challenges.remove(winner_index);
+            deliver_dual(&mut pair, false, winning_challenge, START);
+            deliver_dual(&mut pair, false, challenges.remove(0), START + 1);
+            let a_frames = std::iter::from_fn(|| pair.a.next_udp_frame()).collect::<Vec<_>>();
+            let finish = a_frames
+                .iter()
+                .find(|f| parse_frame(&f.bytes).unwrap().header.frame_type == FrameType::Finish)
+                .unwrap()
+                .clone();
+            let a_ping = a_frames
+                .iter()
+                .find(|f| parse_frame(&f.bytes).unwrap().header.frame_type == FrameType::CtrlPing)
+                .unwrap()
+                .clone();
+            assert_eq!(a_frames.len(), 2);
+            let winning_a = TransportId(if lan_wins { 11 } else { 12 });
+            assert_eq!(finish.transport, winning_a);
+            assert_eq!(a_ping.transport, winning_a);
+            deliver_dual(&mut pair, true, finish, START + 1);
+            assert_eq!(pair.a.path_probes.len(), 1);
+            assert_eq!(pair.b.path_probes.len(), 1);
+            let b_frames = std::iter::from_fn(|| pair.b.next_udp_frame()).collect::<Vec<_>>();
+            assert_eq!(b_frames.len(), 2);
+            for frame in b_frames {
+                assert_eq!(frame.transport, winning_b);
+                deliver_dual(&mut pair, false, frame, START + 2);
+            }
+            let pong_to_b = std::iter::from_fn(|| pair.a.next_udp_frame())
+                .find(|f| parse_frame(&f.bytes).unwrap().header.frame_type == FrameType::CtrlPong)
+                .unwrap();
+            deliver_dual(&mut pair, true, pong_to_b, START + 3);
+            assert_eq!(
+                pair.b.snapshot(START + 3).selected_path.unwrap().transport,
+                winning_b
+            );
+            assert!(pair.a.snapshot(START + 3).selected_path.is_none());
+            deliver_dual(&mut pair, true, a_ping, START + 4);
+            let pong_to_a = std::iter::from_fn(|| pair.b.next_udp_frame())
+                .find(|f| parse_frame(&f.bytes).unwrap().header.frame_type == FrameType::CtrlPong)
+                .unwrap();
+            let highest = pair.a.hs.session().unwrap().rx.highest();
+            pair.a.handle_datagram_on(
+                TransportId(if lan_wins { 12 } else { 11 }),
+                if lan_wins {
+                    public_endpoint(false)
+                } else {
+                    pair.b_endpoint
+                },
+                &pong_to_a.bytes,
+                START + 5,
+            );
+            assert!(pair.a.snapshot(START + 5).selected_path.is_none());
+            assert_eq!(pair.a.hs.session().unwrap().rx.highest(), highest);
+            deliver_dual(&mut pair, false, pong_to_a, START + 100);
+            let a_selected = if lan_wins {
+                a_lan.path
+            } else {
+                public_candidate(true).path
+            };
+            let b_selected = if lan_wins {
+                b_lan.path
+            } else {
+                public_candidate(false).path
+            };
+            assert_eq!(pair.a.snapshot(START + 100).selected_path, Some(a_selected));
+            assert_eq!(pair.b.snapshot(START + 100).selected_path, Some(b_selected));
+            assert_eq!(
+                pair.a.snapshot(START).session_id,
+                pair.b.snapshot(START).session_id
+            );
+            let mut now = START + 100;
+            for _ in 0..100 {
+                now += 50;
+                pair.a.tick(now);
+                pair.b.tick(now);
+                pump_dual(&mut pair, now);
+                if pair.a.snapshot(now).currently_healthy && pair.b.snapshot(now).currently_healthy
+                {
+                    break;
+                }
+            }
+            assert!(pair.a.snapshot(now).currently_healthy);
+            assert!(pair.b.snapshot(now).currently_healthy);
+            pair.a.set_paths(&[if lan_wins {
+                public_candidate(true)
+            } else {
+                a_lan
+            }]);
+            pair.b.set_paths(&[if lan_wins {
+                public_candidate(false)
+            } else {
+                b_lan
+            }]);
+            let ab = ipv4(A_VIP, B_VIP, 20, 0);
+            let ba = ipv4(B_VIP, A_VIP, 24, 0);
+            pair.a.send_ipv4(&ab, now).unwrap();
+            pair.b.send_ipv4(&ba, now).unwrap();
+            pump_dual(&mut pair, now);
+            assert_eq!(pair.a.next_ipv4_packet(), Some(ba));
+            assert_eq!(pair.b.next_ipv4_packet(), Some(ab));
+            assert_eq!(pair.a.snapshot(now).selected_path, Some(a_selected));
+            assert_eq!(pair.b.snapshot(now).selected_path, Some(b_selected));
+        }
+    }
+    fn authenticated_probe(sender: &PeerEngine, nonce: u64, now: u64) -> Vec<u8> {
+        let mut probe_nonce = [0; 32];
+        probe_nonce[..8].copy_from_slice(&nonce.to_be_bytes());
+        encode_frame(
+            FrameType::Probe,
+            crate::wire::Direction::HiToLo,
+            sender.relationship_id,
+            0,
+            0,
+            &crate::wire::ProbePayload {
+                sender: sender.self_key,
+                receiver: sender.peer_key,
+                boot_id: sender.boot_id,
+                generation: sender.generation,
+                issued_at_unix_ms: now,
+                probe_nonce,
+            }
+            .encode(),
+            &sender.hs.probe_key(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn probe_replay_is_source_independent_and_learned_hints_survive_refresh() {
+        let mut pair = lan_pair();
+        pair.a.set_paths(&[]);
+        let probe = authenticated_probe(&pair.b, 1, START);
+        let mut bad = probe.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        let before = pair.a.hs.state_bytes();
+        pair.a
+            .handle_datagram_on(TransportId(11), pair.b_endpoint, &bad, START);
+        assert_eq!(pair.a.hs.state_bytes(), before);
+        pair.a
+            .handle_datagram_on(TransportId(11), pair.b_endpoint, &probe, START);
+        let state_bytes = pair.a.hs.state_bytes();
+        for host in 5..20 {
+            pair.a
+                .handle_datagram_on(TransportId(12), lan_endpoint(host), &probe, START + 1);
+        }
+        assert_eq!(pair.a.hs.state_bytes(), state_bytes);
+        assert_eq!(pair.a.snapshot(START).candidate_count, 1);
+        pair.a.set_paths(&[lan_candidate(11, 9)]);
+        assert_eq!(pair.a.snapshot(START).candidate_count, 2);
+        pair.a.set_paths(&[]);
+        assert_eq!(pair.a.snapshot(START).candidate_count, 1);
+        pair.a.remove_transport(TransportId(11));
+        assert_eq!(pair.a.snapshot(START).candidate_count, 0);
+        pair.a
+            .set_transports(&[lan_policy(13, 1), lan_policy(12, 3)]);
+        pair.a
+            .handle_datagram_on(TransportId(13), pair.b_endpoint, &probe, START + 2);
+        assert_eq!(pair.a.snapshot(START).candidate_count, 0);
+        let fresh = authenticated_probe(&pair.b, 2, START + 3);
+        pair.a
+            .handle_datagram_on(TransportId(13), pair.b_endpoint, &fresh, START + 3);
+        assert_eq!(pair.a.snapshot(START).candidate_count, 1);
+        pair.a.set_paths(&[]);
+        pair.a
+            .tick(START + 3 + crate::handshake::CLOCK_SKEW_TOLERANCE_MS);
+        assert_eq!(pair.a.snapshot(START).candidate_count, 0);
+    }
+    #[test]
+    fn probe_dedup_cache_is_bounded_and_does_not_evict_live_nonces() {
+        let mut pair = lan_pair();
+        pair.a.set_paths(&[]);
+        for nonce in 0..crate::handshake::MAX_SEEN_PROBES as u64 {
+            let probe = authenticated_probe(&pair.b, nonce, START);
+            pair.a
+                .handle_datagram_on(TransportId(11), pair.b_endpoint, &probe, START);
+        }
+        let full = pair.a.hs.state_bytes();
+        let probe = authenticated_probe(&pair.b, 999, START);
+        pair.a
+            .handle_datagram_on(TransportId(11), lan_endpoint(9), &probe, START);
+        assert_eq!(pair.a.hs.state_bytes(), full);
+        assert_eq!(pair.a.snapshot(START).candidate_count, 1);
+        let original = authenticated_probe(&pair.b, 0, START);
+        pair.a
+            .handle_datagram_on(TransportId(12), lan_endpoint(8), &original, START);
+        assert_eq!(pair.a.snapshot(START).candidate_count, 1);
+        let later = START + crate::handshake::CLOCK_SKEW_TOLERANCE_MS + 1;
+        pair.a.tick(later);
+        pair.a
+            .handle_datagram_on(TransportId(12), lan_endpoint(8), &original, later);
+        assert_eq!(pair.a.snapshot(later).candidate_count, 0);
+        let fresh = authenticated_probe(&pair.b, 1000, later);
+        pair.a
+            .handle_datagram_on(TransportId(12), lan_endpoint(8), &fresh, later);
+        assert_eq!(pair.a.snapshot(later).candidate_count, 1);
+    }
+    #[test]
+    fn initial_hellos_retries_and_probes_share_the_relationship_budget() {
+        let mut pair = lan_pair();
+        let paths = (5..21)
+            .map(|host| lan_candidate(11, host))
+            .collect::<Vec<_>>();
+        assert_eq!(pair.a.set_paths(&paths).accepted, 16);
+        let mut counts = std::collections::HashMap::<PathEndpoint, usize>::new();
+        for second in 0..4 {
+            if second == 0 {
+                pair.a.send_responder_probe(paths[0].path, START);
+                pair.a.send_responder_probe(paths[0].path, START);
+            }
+            for _ in 0..3 {
+                pair.a.tick(START + second * 1_000);
+            }
+            let frames = std::iter::from_fn(|| pair.a.next_udp_frame()).collect::<Vec<_>>();
+            assert!(frames.len() <= 10);
+            let mut per_path = std::collections::HashMap::<PathEndpoint, usize>::new();
+            for frame in frames {
+                let path = PathEndpoint {
+                    transport: frame.transport,
+                    remote: frame.target,
+                };
+                *per_path.entry(path).or_default() += 1;
+                match parse_frame(&frame.bytes).unwrap().header.frame_type {
+                    FrameType::Hello => *counts.entry(path).or_default() += 1,
+                    FrameType::Probe => assert_eq!(second, 0),
+                    other => panic!("unexpected proactive frame {other:?}"),
+                }
+            }
+            assert!(per_path.values().all(|count| *count <= 2));
+        }
+        assert_eq!(counts.len(), 16);
+        assert!(counts.values().any(|count| *count > 1));
+    }
+    #[test]
+    fn transport_prefix_refresh_invalidates_only_disallowed_paths() {
+        let mut pair = lan_pair();
+        let now = establish_lan(&mut pair);
+        let selected = pair.a.snapshot(now).selected_path;
+        let mut narrowed = lan_policy(11, 1);
+        narrowed.lan_subnets[0].prefix_len = 29;
+        pair.a
+            .set_transports(&[narrowed.clone(), lan_policy(12, 3)]);
+        assert_eq!(pair.a.snapshot(now).selected_path, selected);
+        assert!(pair.a.snapshot(now).currently_healthy);
+        narrowed.lan_subnets = vec![LanSubnet {
+            address: Ipv4Addr::new(192, 168, 8, 1),
+            prefix_len: 24,
+        }];
+        pair.a
+            .set_paths(&[lan_candidate(11, 2), lan_candidate(12, 2)]);
+        pair.a.set_transports(&[narrowed, lan_policy(12, 3)]);
+        assert_eq!(pair.a.snapshot(now).selected_path, None);
+        assert_eq!(pair.a.snapshot(now).session_id, None);
+        assert_eq!(pair.a.snapshot(now).candidate_count, 1);
+        let mut alias = lan_candidate(11, 2);
+        alias.path.remote.ip = Ipv4Addr::new(192, 168, 8, 2);
+        assert_eq!(pair.a.set_paths(&[alias]).accepted, 0);
+    }
+    #[test]
+    fn changed_bound_address_requires_a_new_transport_id() {
+        let mut pair = lan_pair();
+        let now = establish_lan(&mut pair);
+        pair.a
+            .set_transports(&[lan_policy(11, 5), lan_policy(12, 3)]);
+        assert!(pair.a.snapshot(now).selected_path.is_none());
+        assert!(
+            pair.a
+                .transports
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|p| p.transport != TransportId(11))
+        );
+        assert_eq!(pair.a.set_paths(&[lan_candidate(11, 2)]).accepted, 0);
+    }
+    #[test]
+    fn narrower_same_link_prefix_clears_disallowed_selected_path() {
+        let mut pair = pair();
+        pair.a_endpoint = lan_endpoint(1);
+        pair.b_endpoint = lan_endpoint(130);
+        pair.a.set_transports(&[lan_policy(11, 1)]);
+        pair.b.set_transports(&[lan_policy(21, 130)]);
+        pair.a.set_paths(&[lan_candidate(11, 130)]);
+        pair.b.set_paths(&[lan_candidate(21, 1)]);
+        let now = establish_lan(&mut pair);
+        let mut narrowed = lan_policy(11, 1);
+        narrowed.lan_subnets[0].prefix_len = 25;
+        pair.a.set_transports(&[narrowed]);
+        assert!(pair.a.snapshot(now).session_id.is_none());
+        assert!(pair.a.snapshot(now).selected_path.is_none());
+        assert_eq!(pair.a.snapshot(now).candidate_count, 0);
+        assert!(pair.a.next_udp_frame().is_none());
+    }
+    #[test]
+    fn full_outbox_defers_mandatory_finish_without_spending_retries() {
+        let mut pair = lan_pair();
+        pair.a.tick(START);
+        let hello = pair.a.next_udp_frame().unwrap();
+        pair.b
+            .handle_datagram_on(TransportId(21), pair.a_endpoint, &hello.bytes, START);
+        let challenge = pair.b.next_udp_frame().unwrap();
+        for _ in 0..crate::engine::MAX_UDP_OUTBOX {
+            assert!(pair.a.queue_frame(lan_candidate(11, 2).path, vec![]));
+        }
+        for second in 0..20 {
+            pair.a.handle_datagram_on(
+                TransportId(11),
+                pair.b_endpoint,
+                &challenge.bytes,
+                START + second * 1_000,
+            );
+        }
+        assert!(pair.a.snapshot(START).session_id.is_none());
+        while pair.a.next_udp_frame().is_some() {}
+        pair.a.handle_datagram_on(
+            TransportId(11),
+            pair.b_endpoint,
+            &challenge.bytes,
+            START + 20_000,
+        );
+        let finish = pair.a.next_udp_frame().unwrap();
+        assert_eq!(
+            parse_frame(&finish.bytes).unwrap().header.frame_type,
+            FrameType::Finish
+        );
+        assert!(pair.a.snapshot(START + 20_000).session_id.is_some());
+    }
 }

@@ -1,4 +1,4 @@
-//! Resident service wiring: one physical UDP socket, ntfy, PeerEngine and utun.
+//! Resident wiring: bounded physical transports, discovery, PeerEngine and utun.
 //!
 //! Public-network operation is explicit by invoking `daemon`. utun creation and
 //! its owned peer /32 route additionally require `--allow-tun`. The offline
@@ -11,23 +11,30 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
-use lzh_hole_discovery::candidate::{CandidateSource, Endpoint, validate_publishable};
+use lzh_hole_discovery::candidate::{CandidateSource, Endpoint};
 use lzh_hole_discovery::peer_record::{PeerRecordPolicy, PeerRecordReject};
 use lzh_hole_discovery::record::{
     ContactRecord, MAX_LIFETIME_MS, RecordCandidate, reserve_sequence,
 };
-use lzh_hole_discovery::stun::{
-    TRANSACTION_ID_LEN, build_binding_request, looks_like_stun, parse_binding_response_from,
+use lzh_hole_discovery::stun::{TRANSACTION_ID_LEN, looks_like_stun};
+use lzh_hole_discovery::{
+    CandidateScope, DiscoveryUpdate, LanAdvertisement, LanDiscovery, LanObservation, LanScope,
+    PublicDiscovery,
 };
-use lzh_hole_net::interface::{InterfaceInfo, enumerate_interfaces, interfaces_with_ipv4_route};
-use lzh_hole_net::socket::{AsyncPhysicalSocket, PhysicalSocket, RecvMeta};
+use lzh_hole_net::interface::{
+    InterfaceInfo, InterfacePrefixes, enumerate_interface_prefixes, has_scoped_direct_route_from,
+    interfaces_with_ipv4_route, ipv4_route_sources,
+};
+use lzh_hole_net::mdns::{MdnsClient, MdnsEvent, OperationId};
+use lzh_hole_net::socket::RecvMeta;
 use lzh_hole_net::tun::{TunConfig, Tunnel, TunnelError};
 use lzh_hole_protocol::engine::{
     CandidatePolicy, EngineBuildError, EngineConfig, EngineSnapshot, PeerEngine,
 };
 use lzh_hole_protocol::handshake::HandshakeConfig;
+use lzh_hole_protocol::path::{LanSubnet, PathCandidate, TransportPolicy};
 use lzh_hole_store::{FileLock, HighWaterError, PeerRecordCache};
-use lzh_hole_types::{BootId, DiscoveryPublicKey, Secret32};
+use lzh_hole_types::{BootId, DiscoveryPublicKey, Secret32, TransportId};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at, timeout};
@@ -46,29 +53,23 @@ use lzh_hole_discovery::{
 use lzh_hole_store::{PairingError, StateDir, read_private_bytes, write_private_bytes};
 
 const ENGINE_TICK: Duration = Duration::from_millis(250);
+mod candidates;
 mod dataplane;
+mod discovery;
 mod lifecycle;
-mod signaling;
 mod status;
-mod stun;
+mod transport;
 
-use lifecycle::open_network;
-use signaling::{NtfyBlock, PendingRequest};
+use candidates::{CandidateRegistry, CandidateTransport};
+use discovery::{MdnsOperation, NtfyBlock};
 use status::component;
-use stun::StunState;
+use transport::{TransportDatagram, TransportSet};
 
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const RECOVERY_RETRY: Duration = Duration::from_secs(5);
 const INTERFACE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-const STUN_TIMEOUT: Duration = Duration::from_secs(3);
-const STUN_INTERVAL: Duration = Duration::from_secs(5);
-const STUN_MAPPING_TTL_MS: u64 = 120_000;
-const REQUEST_RETRY: Duration = Duration::from_secs(30);
-const MAX_REQUEST_RETRY: Duration = Duration::from_secs(30 * 60);
-const REQUEST_REFRESH: Duration = Duration::from_secs(45 * 60);
 const MAX_OWN_MAPPINGS: usize = 8;
 const NTFY_CHANNEL_CAPACITY: usize = 16;
-const MAX_DATAGRAM_BYTES: usize = 64 * 1024;
 
 /// Daemon setup or runtime failure. Network errors are normally handled inside
 /// the event loop and reported in status rather than terminating the process.
@@ -259,32 +260,32 @@ fn socket_addr(endpoint: Endpoint) -> SocketAddrV4 {
     SocketAddrV4::new(endpoint.ip, endpoint.port)
 }
 
-fn request_retry_delay(failures: u32) -> Duration {
-    let shift = failures.saturating_sub(1).min(6);
-    REQUEST_RETRY
-        .checked_mul(1u32 << shift)
-        .unwrap_or(MAX_REQUEST_RETRY)
-        .min(MAX_REQUEST_RETRY)
-}
-
 struct Daemon {
     resolved: ResolvedConfig,
     state: StateDir,
-    psk: Secret32,
     signing_key: SigningKey,
     _publisher_lock: FileLock,
     peer_cache: PeerRecordCache,
     exchange: ExchangeTracker,
     network_enabled: bool,
-    socket: Option<AsyncPhysicalSocket>,
-    interface_name: String,
+    transports: TransportSet,
     interface_failures: BTreeMap<String, u64>,
-    bind_ip: Ipv4Addr,
     engine: Option<PeerEngine>,
-    candidates: Vec<Endpoint>,
+    registry: CandidateRegistry,
+    paths: Vec<PathCandidate>,
+    topology: Vec<InterfacePrefixes>,
+    lan_scopes: BTreeMap<u32, LanScope>,
+    next_scope_generation: u64,
+    clock: Instant,
+    public: PublicDiscovery,
+    lan: LanDiscovery,
+    mdns: Option<MdnsClient>,
+    mdns_operations: BTreeMap<OperationId, MdnsOperation>,
+    next_mdns_retry: Instant,
+    lan_status: ComponentStatus,
+    stun_status: ComponentStatus,
     boot_id: BootId,
     generation: u64,
-    stun: StunState,
     tunnel: Option<Tunnel>,
     tun_status: ComponentStatus,
     route_status: ComponentStatus,
@@ -294,10 +295,6 @@ struct Daemon {
     ntfy_task: Option<JoinHandle<Result<(), NtfyError>>>,
     ntfy_subscribed: bool,
     ntfy_block: Option<NtfyBlock>,
-    pending_request: Option<PendingRequest>,
-    request_failures: u32,
-    next_request: Instant,
-    next_recovery: Option<Instant>,
     next_interface_check: Instant,
     bytes: ByteCounters,
     io_drops: DropCounters,
@@ -333,32 +330,14 @@ impl Daemon {
         let peer_cache = PeerRecordCache::load(&state.file("peer-record.json"))?;
         let boot_id = BootId::random().map_err(|error| DaemonError::State(error.to_string()))?;
         let generation = 1;
-        let mut interface_failures = BTreeMap::new();
-        let (socket, interface_name, bind_ip, engine, stun) = if !network_enabled {
-            (
-                None,
-                "offline".to_owned(),
-                Ipv4Addr::UNSPECIFIED,
-                None,
-                StunState::new(Vec::new()),
-            )
+        let engine = if network_enabled {
+            Some(lifecycle::make_engine(
+                &resolved, &psk, boot_id, generation,
+            )?)
         } else {
-            let opened = open_network(
-                &resolved,
-                &psk,
-                boot_id,
-                generation,
-                &[],
-                &mut interface_failures,
-            )?;
-            (
-                Some(opened.socket),
-                opened.interface_name,
-                opened.bind_ip,
-                Some(opened.engine),
-                StunState::new(resolved.config.stun_seeds.clone()),
-            )
+            None
         };
+        let lan = LanDiscovery::new(resolved.relationship.peer_public_key);
 
         let (tunnel, tun_status, route_status) = if allow_tun {
             let tunnel = Tunnel::create(
@@ -424,24 +403,32 @@ impl Daemon {
         snapshot.routes = route_status.clone();
         snapshot_tx.send_replace(snapshot.clone());
         let now = Instant::now();
-        Ok(Self {
+        let mut daemon = Self {
             resolved,
             state,
-            psk,
             signing_key,
             _publisher_lock: publisher_lock,
             peer_cache,
             exchange: ExchangeTracker::default(),
             network_enabled,
-            socket,
-            interface_name,
-            interface_failures,
-            bind_ip,
+            transports: TransportSet::default(),
+            interface_failures: BTreeMap::new(),
             engine,
-            candidates: Vec::new(),
+            registry: CandidateRegistry::default(),
+            paths: Vec::new(),
+            topology: Vec::new(),
+            lan_scopes: BTreeMap::new(),
+            next_scope_generation: 1,
+            clock: now,
+            public: PublicDiscovery::new(),
+            lan,
+            mdns: None,
+            mdns_operations: BTreeMap::new(),
+            next_mdns_retry: now,
+            lan_status: component(ComponentState::Starting, "no Bonjour observation yet", None),
+            stun_status: component(ComponentState::Starting, "no public mapping measured", None),
             boot_id,
             generation,
-            stun,
             tunnel,
             tun_status,
             route_status,
@@ -451,17 +438,23 @@ impl Daemon {
             ntfy_task: None,
             ntfy_subscribed: false,
             ntfy_block: None,
-            pending_request: None,
-            request_failures: 0,
-            next_request: now,
-            next_recovery: None,
             next_interface_check: now + INTERFACE_CHECK_INTERVAL,
             bytes: ByteCounters::default(),
             io_drops: DropCounters::default(),
             last_healthy_unix_ms: None,
             snapshot,
             snapshot_tx,
-        })
+        };
+        if network_enabled {
+            daemon.refresh_network();
+        } else {
+            daemon.lan_status = component(
+                ComponentState::NotConfigured,
+                "disabled by test-only component injection",
+                None,
+            );
+        }
+        Ok(daemon)
     }
 
     async fn event_loop(
@@ -473,8 +466,8 @@ impl Daemon {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .map_err(|error| DaemonError::Network(format!("SIGTERM handler: {error}")))?;
+        self.housekeeping().await;
         loop {
-            self.housekeeping().await;
             self.publish_snapshot();
             if *shutdown.borrow() {
                 return Ok(());
@@ -483,7 +476,8 @@ impl Daemon {
                 _ = ticker.tick() => LoopEvent::Tick,
                 command = commands.recv() => LoopEvent::Command(command),
                 ntfy = next_ntfy(&mut self.ntfy_events) => LoopEvent::Ntfy(ntfy),
-                udp = recv_udp(self.socket.as_ref()) => LoopEvent::Udp(udp),
+                udp = self.transports.recv() => LoopEvent::Udp(udp),
+                mdns = next_mdns(&mut self.mdns) => LoopEvent::Mdns(mdns),
                 tun = recv_tun(self.tunnel.as_ref(), self.resolved.config.mtu) => LoopEvent::Tun(tun),
                 _ = tokio::signal::ctrl_c() => LoopEvent::Stop,
                 _ = sigterm.recv() => LoopEvent::Stop,
@@ -492,7 +486,7 @@ impl Daemon {
                 }
             };
             match event {
-                LoopEvent::Tick => {}
+                LoopEvent::Tick => self.housekeeping().await,
                 LoopEvent::Stop => return Ok(()),
                 LoopEvent::Command(None) => return Ok(()),
                 LoopEvent::Command(Some(command)) => self.handle_command(command).await,
@@ -507,6 +501,7 @@ impl Daemon {
                 }
                 LoopEvent::Ntfy(Some(event)) => self.handle_ntfy(event).await,
                 LoopEvent::Udp(udp) => self.handle_udp(udp).await,
+                LoopEvent::Mdns(event) => self.handle_mdns(event),
                 LoopEvent::Tun(tun) => self.handle_tun(tun).await,
             }
             self.drain_engine().await;
@@ -518,35 +513,23 @@ impl Daemon {
         if let Some(engine) = &mut self.engine {
             engine.tick(now_ms);
         }
-        self.stun
-            .mappings
-            .retain(|_, observed| now_ms.saturating_sub(*observed) < STUN_MAPPING_TTL_MS);
-        if self
-            .pending_request
-            .as_ref()
-            .is_some_and(|pending| now_ms >= pending.expires_at_unix_ms)
-        {
-            if let Some(pending) = self.pending_request.take() {
-                self.exchange.cancel_request(pending.id);
-            }
-            self.request_failures = self.request_failures.saturating_add(1).min(16);
-            self.next_request = Instant::now() + request_retry_delay(self.request_failures);
+        let now = self.monotonic_ms();
+        let expired = self.public.expire(now);
+        if let Some(id) = expired.expired_request {
+            self.exchange.cancel_request(id);
         }
-        if self
-            .next_recovery
-            .is_some_and(|deadline| Instant::now() >= deadline)
-            && let Err(error) = self.rebuild_network("scheduled socket recovery").await
-        {
-            self.record_drop("recovery_failed", 1);
-            self.next_recovery = Some(Instant::now() + RECOVERY_RETRY);
-            self.snapshot.session.detail = Some(error);
+        let mut updates = expired.updates;
+        updates.extend(self.lan.expire(now));
+        if !updates.is_empty() {
+            self.apply_discovery_updates(updates);
         }
+        self.registry.expire(now);
+        self.refresh_public_request();
         if self.network_enabled && Instant::now() >= self.next_interface_check {
             self.next_interface_check = Instant::now() + INTERFACE_CHECK_INTERVAL;
-            if !self.physical_interface_valid() && self.socket.is_some() {
-                self.schedule_recovery("selected physical interface or IPv4 disappeared");
-            }
+            self.refresh_network();
         }
+        self.ensure_mdns();
         self.maybe_start_stun().await;
         self.maybe_queue_request();
     }
@@ -554,13 +537,14 @@ impl Daemon {
     async fn handle_command(&mut self, command: ServiceCommand) {
         match command {
             ServiceCommand::Doctor { reply } => {
-                if self.network_enabled && !self.physical_interface_valid() {
-                    self.schedule_recovery("doctor observed an invalid physical interface");
-                }
                 self.publish_snapshot();
                 let _ = reply.send(Ok(self.snapshot.clone()));
             }
         }
+    }
+
+    fn monotonic_ms(&self) -> u64 {
+        self.clock.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
 }
 
@@ -569,13 +553,9 @@ enum LoopEvent {
     Stop,
     Command(Option<ServiceCommand>),
     Ntfy(Option<NtfyEvent>),
-    Udp(UdpEvent),
+    Udp(TransportDatagram),
+    Mdns(std::io::Result<MdnsEvent>),
     Tun(TunEvent),
-}
-
-struct UdpEvent {
-    result: std::io::Result<(usize, RecvMeta)>,
-    buffer: Vec<u8>,
 }
 
 struct TunEvent {
@@ -583,14 +563,11 @@ struct TunEvent {
     buffer: Vec<u8>,
 }
 
-async fn recv_udp(socket: Option<&AsyncPhysicalSocket>) -> UdpEvent {
-    let Some(socket) = socket else {
-        std::future::pending::<()>().await;
-        unreachable!();
-    };
-    let mut buffer = vec![0u8; MAX_DATAGRAM_BYTES];
-    let result = socket.recv_from(&mut buffer).await;
-    UdpEvent { result, buffer }
+async fn next_mdns(mdns: &mut Option<MdnsClient>) -> std::io::Result<MdnsEvent> {
+    match mdns {
+        Some(mdns) => mdns.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn recv_tun(tunnel: Option<&Tunnel>, mtu: u16) -> TunEvent {

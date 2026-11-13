@@ -78,7 +78,7 @@ mod exhaustion_tests {
         now: u64,
     ) {
         for ev in lo.start_attempt(hi_ep, now).expect("attempt") {
-            if let HandshakeEvent::Send { target, frames } = ev {
+            if let HandshakeEvent::Send { target, frames, .. } = ev {
                 let mut queue = frames;
                 let mut hops = 0;
                 while let Some(frame) = queue.pop() {
@@ -336,5 +336,39 @@ mod response_limit_tests {
         let _ = hi.handle_frame(&bad, ep(40001), 1_000);
         // The valid request still gets its response after the interval.
         assert_eq!(frames(hi.handle_frame(&hello, ep(40001), 2_000)).len(), 1);
+    }
+
+    #[test]
+    fn budget_deferral_preserves_hello_and_finish_retry_counts() {
+        for finish_stage in [false, true] {
+            let (mut lo, mut hi) = engines();
+            let hello = frames(lo.start_attempt(ep(40002), 1_000).unwrap()).remove(0);
+            if finish_stage {
+                let challenge = frames(hi.handle_frame(&hello, ep(40001), 1_000)).remove(0);
+                assert_eq!(
+                    frames(lo.handle_frame(&challenge, ep(40002), 1_000)).len(),
+                    1
+                );
+            }
+            for second in 2..25 {
+                assert!(frames(lo.tick_with_budget(second * 1_000, |_, _| false)).is_empty());
+            }
+            let expected = MAX_RETRANSMITS - if finish_stage { 2 } else { 1 };
+            let mut retries = 0;
+            for second in 25..40 {
+                for frame in frames(lo.tick_with_budget(second * 1_000, |_, _| true)) {
+                    assert_eq!(
+                        parse_frame(&frame).unwrap().header.frame_type,
+                        if finish_stage {
+                            FrameType::Finish
+                        } else {
+                            FrameType::Hello
+                        }
+                    );
+                    retries += 1;
+                }
+            }
+            assert_eq!(retries, expected);
+        }
     }
 }

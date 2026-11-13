@@ -6,7 +6,8 @@ control_socket = "/var/run/lzh-hole/control.sock"
 # 替换为实际管理员 UID（id -u）。root 始终也被 peer_cred 鉴权允许。
 management_uid = 501
 
-# 省略 interface/bind_ip 时自动选择有公网路由的物理接口（推荐）。
+# 省略 interface/bind_ip 时保留最多 8 个物理接口/IPv4 sockets（推荐）。
+# 优先有公网路由的接口；LAN 开启时无 WAN 路由的接口仍可用。
 # 仅需固定接口时填写；不要使用 utun/lo0/gif/stf：
 # interface = "en0"
 # 多地址物理接口才设置，且必须是该接口真实持有的 IPv4：
@@ -26,3 +27,7 @@ topic = "lzh-hole-v1-00112233445566778899aabbccddeeff"
 # DNS 返回 Fake-IP 时才设置：把 base_url 的 hostname 解析到该公网 IPv4，
 # 仍保留 HTTPS hostname/SNI/证书校验，不修改系统 DNS/VPN/默认路由。
 # resolve_ip = "159.203.148.75"
+
+[lan]
+# 默认 true，旧配置省略本节也开启。仅通告真实绑定 endpoint 的公共元数据。
+enabled = true

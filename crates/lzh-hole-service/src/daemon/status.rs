@@ -19,14 +19,62 @@ impl Daemon {
                 None,
             )
         } else {
-            self.stun.status.clone()
+            if self.public.own_mappings(self.monotonic_ms()).is_empty() {
+                component(
+                    ComponentState::Degraded,
+                    "no fresh public mapping; independent LAN session may remain healthy",
+                    self.stun_status.last_success_unix_ms,
+                )
+            } else {
+                self.stun_status.clone()
+            }
         };
+        self.snapshot.lan = self.lan_status.clone();
         self.snapshot.ntfy = self.ntfy_status.clone();
         self.snapshot.tun = self.tun_status.clone();
         self.snapshot.routes = self.route_status.clone();
         self.snapshot.session = self.session_status(engine_snapshot, now);
         self.snapshot.overlay.direct_reachable = engine_snapshot.map(|s| s.direct_reachable);
         self.snapshot.overlay.currently_healthy = engine_snapshot.map(|s| s.currently_healthy);
+        self.snapshot.current_path = engine_snapshot
+            .and_then(|snapshot| snapshot.selected_path)
+            .and_then(|path| {
+                self.transports.get(path.transport).map(|socket| {
+                    lzh_hole_control::CurrentPathStatus {
+                        transport_id: path.transport.0,
+                        interface: socket.interface.clone(),
+                        local_endpoint: socket.local.to_string(),
+                        remote_endpoint: path.remote.to_string(),
+                        kind: if lzh_hole_discovery::candidate::is_private(path.remote.ip) {
+                            lzh_hole_control::DiscoveryOrigin::Lan
+                        } else {
+                            lzh_hole_control::DiscoveryOrigin::Public
+                        },
+                    }
+                })
+            });
+        self.snapshot.candidates = self
+            .paths
+            .iter()
+            .map(|candidate| lzh_hole_control::CandidateStatus {
+                origin: match candidate.kind {
+                    lzh_hole_protocol::path::PathKind::Lan => {
+                        lzh_hole_control::DiscoveryOrigin::Lan
+                    }
+                    lzh_hole_protocol::path::PathKind::Public => {
+                        lzh_hole_control::DiscoveryOrigin::Public
+                    }
+                },
+                transport_id: candidate.path.transport.0,
+                remote_endpoint: candidate.path.remote.to_string(),
+            })
+            .collect();
+        let counters = self.registry.counters;
+        self.snapshot.discovery = lzh_hole_control::DiscoveryCounters {
+            accepted_updates: counters.accepted_updates,
+            rejected_updates: counters.rejected_updates,
+            withdrawals: counters.withdrawals,
+        };
         self.snapshot.overlay.detail = Some(
             "engine health is actual PONG evidence; transparent TCP/UDP/ICMP and P0 have not been accepted by this daemon"
                 .to_owned(),

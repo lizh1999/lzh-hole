@@ -13,6 +13,7 @@ use std::mem;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, RawFd};
+use std::task::{Context, Poll};
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::io::Interest;
@@ -270,11 +271,37 @@ impl AsyncPhysicalSocket {
             .await
     }
 
+    /// Try once on the retained nonblocking socket. WouldBlock need not stall
+    /// other healthy transports; control retransmissions remain protocol-owned.
+    pub fn try_send_to(&self, buf: &[u8], target: SocketAddrV4) -> io::Result<usize> {
+        self.io.get_ref().send_to(buf, target)
+    }
+
     /// Receive one datagram and the original `recvmsg` metadata.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, RecvMeta)> {
         self.io
             .async_io(Interest::READABLE, |socket| socket.recv_from(buf))
             .await
+    }
+
+    /// Allocation-free, cancellation-safe receive into caller-retained storage.
+    /// Only one read waiter may use a socket at a time.
+    pub fn poll_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<(usize, RecvMeta)>> {
+        loop {
+            let mut readiness = match self.io.poll_read_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(readiness)) => readiness,
+            };
+            match readiness.try_io(|io| io.get_ref().recv_from(buf)) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_) => continue,
+            }
+        }
     }
 }
 
@@ -305,6 +332,42 @@ mod tests {
     fn unknown_interface_is_refused() {
         let err = PhysicalSocket::open("no-such-if", Ipv4Addr::LOCALHOST, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn polled_receive_is_cancellation_safe_and_clears_stale_readiness() {
+        let sender = async_loopback();
+        let receiver = async_loopback();
+        let mut buffer = [0; 64];
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(receiver.poll_recv_from(&mut cx, &mut buffer).is_pending());
+        sender
+            .send_to(b"first", receiver.get_ref().local_addr())
+            .await
+            .unwrap();
+        let (len, meta) = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| receiver.poll_recv_from(cx, &mut buffer)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&buffer[..len], b"first");
+        assert_eq!(meta.source, sender.get_ref().local_addr());
+        assert_eq!(meta.dest, Some(Ipv4Addr::LOCALHOST));
+        assert!(receiver.poll_recv_from(&mut cx, &mut buffer).is_pending());
+        sender
+            .send_to(b"second", receiver.get_ref().local_addr())
+            .await
+            .unwrap();
+        let (len, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| receiver.poll_recv_from(cx, &mut buffer)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&buffer[..len], b"second");
     }
 
     #[tokio::test(flavor = "current_thread")]

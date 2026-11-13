@@ -2,9 +2,10 @@ use super::status::component;
 use super::*;
 
 impl Daemon {
-    pub(super) async fn handle_udp(&mut self, event: UdpEvent) {
+    pub(super) async fn handle_udp(&mut self, event: TransportDatagram) {
+        let id = event.transport;
         let (result, buffer) = (event.result, event.buffer);
-        let Some(socket) = &self.socket else {
+        let Some(socket) = self.transports.get(id) else {
             self.record_drop("no_socket", 1);
             return;
         };
@@ -12,32 +13,33 @@ impl Daemon {
             Ok(value) => value,
             Err(error) => {
                 self.record_drop("udp_recv_failed", 1);
-                self.schedule_recovery(&format!("UDP receive failed: {error}"));
+                self.snapshot.session.detail = Some(format!(
+                    "transport {} receive failed: {error}; other transports retained",
+                    id.0
+                ));
+                self.retire_transport(id);
                 return;
             }
         };
+        self.bytes.udp_rx = self.bytes.udp_rx.saturating_add(size as u64);
         if metadata
             .ifindex
-            .is_some_and(|index| index != socket.get_ref().bound_ifindex())
+            .is_some_and(|index| index != socket.interface_index)
         {
             self.record_drop("wrong_interface", 1);
             return;
         }
-        if metadata
-            .dest
-            .is_some_and(|dest| dest != *socket.get_ref().local_addr().ip())
-        {
+        if metadata.dest.is_some_and(|dest| dest != *socket.local.ip()) {
             self.record_drop("wrong_destination", 1);
             return;
         }
-        self.bytes.udp_rx = self.bytes.udp_rx.saturating_add(size as u64);
         let packet = &buffer[..size];
         if looks_like_stun(packet) {
-            self.handle_stun(packet, metadata);
+            self.handle_stun(id, packet, metadata);
             return;
         }
         if let Some(engine) = &mut self.engine {
-            engine.handle_datagram(endpoint(metadata.source), packet, now_unix_ms());
+            engine.handle_datagram_on(id, endpoint(metadata.source), packet, now_unix_ms());
         } else {
             self.record_drop("engine_unavailable", 1);
         }
@@ -83,18 +85,20 @@ impl Daemon {
             let Some(frame) = frame else {
                 break;
             };
-            let Some(socket) = &self.socket else {
+            let Some(socket) = self.transports.get(frame.transport) else {
                 self.record_drop("no_socket", 1);
                 continue;
             };
             let target = socket_addr(frame.target);
-            match timeout(SOCKET_IO_TIMEOUT, socket.send_to(&frame.bytes, target)).await {
-                Ok(Ok(written)) if written == frame.bytes.len() => {
+            match socket.socket.try_send_to(&frame.bytes, target) {
+                Ok(written) if written == frame.bytes.len() => {
                     self.bytes.udp_tx = self.bytes.udp_tx.saturating_add(written as u64);
                 }
                 _ => {
                     self.record_drop("udp_send_failed", 1);
-                    self.schedule_recovery("UDP engine-frame send failed");
+                    // A per-destination send failure is not evidence that every
+                    // other path/socket disappeared. Topology refresh and
+                    // authenticated health independently decide recovery.
                 }
             }
         }

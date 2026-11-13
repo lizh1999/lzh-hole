@@ -20,15 +20,18 @@ use crate::health::{
     Health, HealthState, OFFLINE_AFTER_MS, PathContext, PendingPing, PongOutcome, ping_flags,
     pong_flags,
 };
-use crate::path::{Endpoint, EndpointReject, classify, validate_remote_target};
+use crate::path::{
+    Endpoint, EndpointReject, PathCandidate, PathEndpoint, PathKind, TransportPolicy, classify,
+    validate_remote_target,
+};
 use crate::session::SessionKeys;
 use crate::wire::{
     CtrlPayload, Direction, FrameType, MAX_PAYLOAD_LEN, ParsedFrame, ProbePayload, WireError,
     encode_frame, parse_frame,
 };
-use lzh_hole_types::{BootId, DiscoveryPublicKey, RelationshipId, Role, Secret32};
+use lzh_hole_types::{BootId, DiscoveryPublicKey, RelationshipId, Role, Secret32, TransportId};
 
-/// Maximum number of configured targets retained for one peer.
+/// Maximum combined configured and unexpired learned targets for one peer.
 pub const MAX_ENGINE_CANDIDATES: usize = 16;
 /// Maximum number of endpoints simultaneously awaiting return-path proof.
 pub const MAX_PENDING_PATHS: usize = 16;
@@ -45,6 +48,7 @@ pub const PATH_CONFIRM_TIMEOUT_MS: u64 = OFFLINE_AFTER_MS;
 
 const PATH_PROBE_INTERVAL_MS: u64 = 1_000;
 const RESPONDER_PROBE_INTERVAL_MS: u64 = 1_000;
+const LEARNED_PATH_TTL_MS: u64 = CLOCK_SKEW_TOLERANCE_MS;
 
 /// Filtering applied both to configured candidates and peer-reflexive sources.
 #[derive(Debug, Clone)]
@@ -159,6 +163,8 @@ pub enum SendError {
 /// One datagram the daemon should send on the retained physical UDP socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpFrame {
+    /// Retained physical socket to send through.
+    pub transport: TransportId,
     /// Actual destination selected or being challenged by the engine.
     pub target: Endpoint,
     /// Complete wire frame, including its MAC.
@@ -219,6 +225,8 @@ pub struct EngineCounters {
 /// A read-only view suitable for daemon state reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineSnapshot {
+    /// Selected local transport and actual remote endpoint.
+    pub selected_path: Option<PathEndpoint>,
     /// Current session, even while its endpoint is still being proved.
     pub session_id: Option<u64>,
     /// The only endpoint currently accepted for DATA injection.
@@ -247,16 +255,38 @@ pub struct EngineSnapshot {
 
 #[derive(Debug)]
 struct CandidateState {
-    endpoint: Endpoint,
+    path: PathEndpoint,
+    kind: PathKind,
     last_probe_ms: Option<u64>,
+    configured: bool,
+    learned_until_ms: Option<u64>,
 }
 
 #[derive(Debug)]
 struct PathProbeState {
-    endpoint: Endpoint,
+    path: PathEndpoint,
     session_id: u64,
     next_probe_ms: u64,
     sent: usize,
+}
+
+#[derive(Debug, Default)]
+struct ProbeBudget {
+    // Proactive HELLO/retries/PROBE/path-PING share 10/s total and 2/s per path.
+    // DATA, normal health and immediate authenticated replies are exempt.
+    recent: VecDeque<(u64, PathEndpoint)>,
+}
+
+impl ProbeBudget {
+    fn allow(&mut self, path: PathEndpoint, now_ms: u64) -> bool {
+        self.recent
+            .retain(|(at, _)| now_ms.saturating_sub(*at) < 1_000);
+        if self.recent.len() >= 10 || self.recent.iter().filter(|(_, p)| *p == path).count() >= 2 {
+            return false;
+        }
+        self.recent.push_back((now_ms, path));
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -279,10 +309,16 @@ pub struct PeerEngine {
     self_vip: Ipv4Addr,
     peer_vip: Ipv4Addr,
     policy: CandidatePolicy,
+    transports: Option<Vec<TransportPolicy>>,
+    ping_paths: VecDeque<([u8; 32], PathEndpoint)>,
+    probe_budget: ProbeBudget,
     candidates: Vec<CandidateState>,
     path_probes: Vec<PathProbeState>,
     path_session: Option<u64>,
-    selected: Option<Endpoint>,
+    session_path: Option<PathEndpoint>,
+    responder_cursor: usize,
+    now_ms: u64,
+    selected: Option<PathEndpoint>,
     health: HealthState,
     udp_out: VecDeque<UdpFrame>,
     ipv4_in: VecDeque<Vec<u8>>,
@@ -329,9 +365,15 @@ impl PeerEngine {
             self_vip: config.self_vip,
             peer_vip: config.peer_vip,
             policy: config.candidate_policy,
+            transports: None,
+            ping_paths: VecDeque::new(),
+            probe_budget: ProbeBudget::default(),
             candidates: Vec::new(),
             path_probes: Vec::new(),
             path_session: None,
+            session_path: None,
+            responder_cursor: 0,
+            now_ms: 0,
             selected: None,
             health: HealthState::new(),
             udp_out: VecDeque::new(),
@@ -344,43 +386,205 @@ impl PeerEngine {
     /// Replace the bounded candidate set. Existing verified paths remain in use
     /// until they fail; the new set is used immediately when no session exists.
     pub fn set_candidates(&mut self, endpoints: &[Endpoint]) -> CandidateUpdate {
+        let paths = endpoints
+            .iter()
+            .map(|remote| PathCandidate {
+                path: PathEndpoint {
+                    transport: TransportId(0),
+                    remote: *remote,
+                },
+                kind: PathKind::Public,
+            })
+            .collect::<Vec<_>>();
+        self.set_paths(&paths)
+    }
+
+    /// Replace trusted socket facts. Omitted sockets are explicitly removed.
+    /// At most sixteen policies and sixteen subnets per socket are retained.
+    pub fn set_transports(&mut self, policies: &[TransportPolicy]) {
+        let old = self
+            .transports
+            .as_ref()
+            .map(|p| p.iter().map(|p| p.transport).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut retained = Vec::<TransportPolicy>::new();
+        for policy in policies.iter().take(MAX_ENGINE_CANDIDATES) {
+            if retained.iter().any(|p| p.transport == policy.transport) {
+                continue;
+            }
+            if self.transports.as_ref().is_some_and(|old| {
+                old.iter().any(|p| {
+                    p.transport == policy.transport && p.local_endpoint != policy.local_endpoint
+                })
+            }) {
+                continue;
+            }
+            retained.push(TransportPolicy {
+                transport: policy.transport,
+                local_endpoint: policy.local_endpoint,
+                lan_subnets: policy
+                    .lan_subnets
+                    .iter()
+                    .take(MAX_ENGINE_CANDIDATES)
+                    .copied()
+                    .filter(|subnet| subnet.contains_host(policy.local_endpoint.ip))
+                    .collect(),
+            });
+        }
+        self.transports = Some(retained);
+        for transport in old {
+            if !self
+                .transports
+                .as_ref()
+                .is_some_and(|p| p.iter().any(|p| p.transport == transport))
+            {
+                self.remove_transport(transport);
+            }
+        }
+        let candidates = std::mem::take(&mut self.candidates);
+        self.candidates = candidates
+            .into_iter()
+            .filter(|c| self.may_path(c.path, c.kind))
+            .collect();
+        for path in self.hs.pending_paths() {
+            if !self.may_source(path) {
+                self.hs.remove_path(path);
+            }
+        }
+        if self.session_path.is_some_and(|p| !self.may_source(p)) {
+            self.invalidate_session();
+        }
+        let queued = std::mem::take(&mut self.udp_out);
+        self.udp_out = queued
+            .into_iter()
+            .filter(|f| {
+                self.may_source(PathEndpoint {
+                    transport: f.transport,
+                    remote: f.target,
+                })
+            })
+            .collect();
+    }
+
+    /// Replace discovery hints without resetting unchanged candidates' timers.
+    /// Discovery withdrawal never tears down an authenticated selected path.
+    pub fn set_paths(&mut self, paths: &[PathCandidate]) -> CandidateUpdate {
         let mut update = CandidateUpdate {
             accepted: 0,
             rejected: 0,
         };
-        self.candidates.clear();
+        let previous = std::mem::take(&mut self.candidates);
         if self.closed {
-            update.rejected = endpoints.len();
+            update.rejected = paths.len();
             return update;
         }
-        for endpoint in endpoints.iter().copied() {
-            if self.candidates.len() >= MAX_ENGINE_CANDIDATES
-                || self
-                    .candidates
-                    .iter()
-                    .any(|candidate| candidate.endpoint == endpoint)
-                || !self.may_target(endpoint)
+        for old in &previous {
+            if old
+                .learned_until_ms
+                .is_some_and(|until| until > self.now_ms)
+                && self.may_path(old.path, old.kind)
             {
+                self.candidates.push(CandidateState {
+                    path: old.path,
+                    kind: old.kind,
+                    last_probe_ms: old.last_probe_ms,
+                    configured: false,
+                    learned_until_ms: old.learned_until_ms,
+                });
+            }
+        }
+        for candidate in paths
+            .iter()
+            .filter(|c| c.kind == PathKind::Lan)
+            .chain(paths.iter().filter(|c| c.kind == PathKind::Public))
+            .copied()
+        {
+            if !self.may_path(candidate.path, candidate.kind) {
                 update.rejected += 1;
                 continue;
             }
+            if let Some(existing) = self
+                .candidates
+                .iter_mut()
+                .find(|c| c.path == candidate.path)
+            {
+                if existing.configured {
+                    update.rejected += 1;
+                } else {
+                    existing.configured = true;
+                    existing.kind = candidate.kind;
+                    update.accepted += 1;
+                }
+                continue;
+            }
+            if self.candidates.len() >= MAX_ENGINE_CANDIDATES {
+                update.rejected += 1;
+                continue;
+            }
+            let last_probe_ms = previous
+                .iter()
+                .find(|old| old.path == candidate.path)
+                .and_then(|old| old.last_probe_ms);
             self.candidates.push(CandidateState {
-                endpoint,
-                last_probe_ms: None,
+                path: candidate.path,
+                kind: candidate.kind,
+                last_probe_ms,
+                configured: true,
+                learned_until_ms: None,
             });
             update.accepted += 1;
         }
+        self.candidates.sort_by_key(|c| c.kind != PathKind::Lan);
         update
+    }
+
+    /// Invalidate a retired local socket, but retain other viable candidates.
+    /// Transport IDs must never be reused during the daemon lifetime.
+    pub fn remove_transport(&mut self, transport: TransportId) {
+        if self.transports.is_none() {
+            self.transports = Some(Vec::new());
+        }
+        if let Some(policies) = &mut self.transports {
+            policies.retain(|p| p.transport != transport);
+        }
+        self.candidates.retain(|c| c.path.transport != transport);
+        self.path_probes.retain(|p| p.path.transport != transport);
+        self.ping_paths.retain(|(_, p)| p.transport != transport);
+        self.udp_out.retain(|f| f.transport != transport);
+        self.hs.remove_transport(transport);
+        if self.selected.is_some_and(|p| p.transport == transport)
+            || (self.selected.is_none()
+                && self.session_path.is_some_and(|p| p.transport == transport))
+        {
+            self.invalidate_session();
+        }
     }
 
     /// Feed one UDP payload and its actual source address into the engine.
     /// Invalid network input is counted and ignored rather than returned as a
     /// local operational error. Replies are taken with `next_udp_frame`.
     pub fn handle_datagram(&mut self, source: Endpoint, datagram: &[u8], now_ms: u64) {
+        self.handle_datagram_on(TransportId(0), source, datagram, now_ms);
+    }
+
+    /// Receive from the actual local socket; discovery cannot override it.
+    pub fn handle_datagram_on(
+        &mut self,
+        transport: TransportId,
+        remote: Endpoint,
+        datagram: &[u8],
+        now_ms: u64,
+    ) {
+        let source = PathEndpoint { transport, remote };
         if self.closed {
             return;
         }
+        self.expire_learned_paths(now_ms);
         self.maybe_reconnect(now_ms);
+        if !self.may_source(source) {
+            self.counters.wrong_endpoint += 1;
+            return;
+        }
         let parsed = match parse_frame(datagram) {
             Ok(parsed) => parsed,
             Err(_) => {
@@ -393,7 +597,39 @@ impl PeerEngine {
             return;
         }
         if parsed.header.frame_type.is_sessionless() {
-            let events = self.hs.handle_frame(datagram, source, now_ms);
+            if matches!(
+                parsed.header.frame_type,
+                FrameType::Hello | FrameType::Challenge | FrameType::Finish
+            ) && self.udp_out.len() >= MAX_UDP_OUTBOX
+            {
+                self.counters.udp_out_dropped += 1;
+                return;
+            }
+            let events = self.hs.handle_frame_on(transport, datagram, remote, now_ms);
+            // A valid responder PROBE can seed a one-sided discovery exchange.
+            // Deduplication and the candidate/attempt bounds prevent allocation
+            // growth; the normal handshake timer performs the actual attempt.
+            if parsed.header.frame_type == FrameType::Probe
+                && events.is_empty()
+                && self.role == Role::Initiator
+                && self.hs.session().is_none()
+            {
+                if let Some(existing) = self.candidates.iter_mut().find(|c| c.path == source) {
+                    existing.learned_until_ms = Some(now_ms.saturating_add(LEARNED_PATH_TTL_MS));
+                } else if self.candidates.len() < MAX_ENGINE_CANDIDATES {
+                    self.candidates.push(CandidateState {
+                        path: source,
+                        kind: if crate::path::is_private(remote.ip) {
+                            PathKind::Lan
+                        } else {
+                            PathKind::Public
+                        },
+                        last_probe_ms: None,
+                        configured: false,
+                        learned_until_ms: Some(now_ms.saturating_add(LEARNED_PATH_TTL_MS)),
+                    });
+                }
+            }
             self.process_handshake_events(events, Some(source), now_ms);
         } else {
             self.handle_session_frame(parsed, source, now_ms);
@@ -406,13 +642,23 @@ impl PeerEngine {
         if self.closed {
             return;
         }
+        self.expire_learned_paths(now_ms);
         self.maybe_reconnect(now_ms);
         self.health.expire(now_ms);
 
         if self.hs.session().is_none() {
             self.drive_handshake(now_ms);
         }
-        let events = self.hs.tick(now_ms);
+        let available = MAX_UDP_OUTBOX.saturating_sub(self.udp_out.len());
+        let mut admitted = 0;
+        let budget = &mut self.probe_budget;
+        let events = self.hs.tick_with_budget(now_ms, |transport, remote| {
+            if admitted >= available || !budget.allow(PathEndpoint { transport, remote }, now_ms) {
+                return false;
+            }
+            admitted += 1;
+            true
+        });
         self.process_handshake_events(events, None, now_ms);
         self.drive_health(now_ms);
     }
@@ -461,7 +707,8 @@ impl PeerEngine {
             });
         EngineSnapshot {
             session_id: self.hs.session().map(|session| session.keys.session_id),
-            selected_endpoint: self.selected,
+            selected_path: self.selected,
+            selected_endpoint: self.selected.map(|p| p.remote),
             health: if self.selected.is_some() {
                 self.health.health(now_ms)
             } else {
@@ -487,8 +734,10 @@ impl PeerEngine {
         self.candidates.clear();
         self.path_probes.clear();
         self.path_session = None;
+        self.session_path = None;
         self.selected = None;
         self.health = HealthState::new();
+        self.ping_paths.clear();
         self.udp_out.clear();
         self.ipv4_in.clear();
     }
@@ -521,6 +770,56 @@ impl PeerEngine {
                     | EndpointReject::Documentation
             )
         )
+    }
+
+    fn expire_learned_paths(&mut self, now_ms: u64) {
+        self.now_ms = self.now_ms.max(now_ms);
+        self.candidates.retain(|c| {
+            c.configured || c.learned_until_ms.is_some_and(|until| until > self.now_ms)
+        });
+    }
+
+    fn may_path(&self, path: PathEndpoint, kind: PathKind) -> bool {
+        let Some(transports) = &self.transports else {
+            return path.transport == TransportId(0)
+                && kind == PathKind::Public
+                && self.may_target(path.remote);
+        };
+        let Some(policy) = transports.iter().find(|p| p.transport == path.transport) else {
+            return false;
+        };
+        let endpoint = path.remote;
+        if endpoint.port == 0
+            || endpoint.ip == self.self_vip
+            || endpoint.ip == self.peer_vip
+            || self.policy.forbidden_addresses.contains(&endpoint.ip)
+            || self.policy.own_endpoints.contains(&endpoint)
+            || self.policy.stun_servers.contains(&endpoint)
+            || transports.iter().any(|p| p.local_endpoint == endpoint)
+        {
+            return false;
+        }
+        match kind {
+            PathKind::Public => validate_remote_target(
+                &endpoint,
+                &self.policy.own_endpoints,
+                &self.policy.forbidden_addresses,
+                &self.policy.stun_servers,
+            )
+            .is_ok(),
+            PathKind::Lan => {
+                !transports
+                    .iter()
+                    .any(|p| p.local_endpoint.ip == endpoint.ip)
+                    && policy.lan_subnets.iter().any(|s| {
+                        s.contains_host(policy.local_endpoint.ip) && s.contains_host(endpoint.ip)
+                    })
+            }
+        }
+    }
+
+    fn may_source(&self, path: PathEndpoint) -> bool {
+        self.may_path(path, PathKind::Public) || self.may_path(path, PathKind::Lan)
     }
 
     fn validate_ipv4(&self, packet: &[u8], inbound: bool) -> Result<(), Ipv4Reject> {
@@ -558,10 +857,10 @@ impl PeerEngine {
         Ok(())
     }
 
-    fn path_context(&self, source: Endpoint) -> Option<PathContext> {
+    fn path_context(&self, source: PathEndpoint) -> Option<PathContext> {
         let session = self.hs.session()?;
         Some(PathContext {
-            endpoint: source,
+            endpoint: source.remote,
             session_id: session.keys.session_id,
             generation: self.generation,
             peer_generation: session.peer_generation,
@@ -586,12 +885,16 @@ impl PeerEngine {
             .is_some_and(|context| self.health.bilateral_confirmed(now_ms, &context))
     }
 
-    fn queue_frame(&mut self, target: Endpoint, bytes: Vec<u8>) -> bool {
+    fn queue_frame(&mut self, target: PathEndpoint, bytes: Vec<u8>) -> bool {
         if self.udp_out.len() >= MAX_UDP_OUTBOX {
             self.counters.udp_out_dropped += 1;
             return false;
         }
-        self.udp_out.push_back(UdpFrame { target, bytes });
+        self.udp_out.push_back(UdpFrame {
+            transport: target.transport,
+            target: target.remote,
+            bytes,
+        });
         self.counters.udp_queued += 1;
         true
     }
@@ -599,7 +902,7 @@ impl PeerEngine {
     fn queue_session_frame(
         &mut self,
         frame_type: FrameType,
-        target: Endpoint,
+        target: PathEndpoint,
         payload: &[u8],
     ) -> Result<(), QueueError> {
         if self.udp_out.len() >= MAX_UDP_OUTBOX {
@@ -648,8 +951,8 @@ impl PeerEngine {
         true
     }
 
-    fn handle_session_frame(&mut self, parsed: ParsedFrame<'_>, source: Endpoint, now_ms: u64) {
-        if !self.may_target(source) {
+    fn handle_session_frame(&mut self, parsed: ParsedFrame<'_>, source: PathEndpoint, now_ms: u64) {
+        if !self.may_source(source) || self.session_path != Some(source) {
             self.counters.wrong_endpoint += 1;
             return;
         }
@@ -690,6 +993,14 @@ impl PeerEngine {
                 }
             }
             FrameType::CtrlPing | FrameType::CtrlPong => {
+                if parsed.header.frame_type == FrameType::CtrlPing
+                    && (self.selected.is_some_and(|selected| selected != source)
+                        || (self.selected.is_none()
+                            && !self.path_probes.iter().any(|p| p.path == source)))
+                {
+                    self.counters.wrong_endpoint += 1;
+                    return;
+                }
                 let decoded = if parsed.header.frame_type == FrameType::CtrlPing {
                     CtrlPayload::decode_ping(parsed.payload)
                 } else {
@@ -718,6 +1029,14 @@ impl PeerEngine {
 
         if parsed.header.frame_type == FrameType::CtrlPong {
             let pong = control.expect("validated PONG");
+            if !self
+                .ping_paths
+                .iter()
+                .any(|(nonce, path)| *nonce == pong.nonce && *path == source)
+            {
+                self.counters.control_rejected += 1;
+                return;
+            }
             let Some(context) = self.path_context(source) else {
                 self.counters.control_rejected += 1;
                 return;
@@ -736,7 +1055,7 @@ impl PeerEngine {
             // health is committed until this returns Accepted.
             let mut validated_health = self.health.clone();
             let PongOutcome::Accepted { path_probe, .. } =
-                validated_health.on_pong(&pong, source, &context, now_ms)
+                validated_health.on_pong(&pong, source.remote, &context, now_ms)
             else {
                 self.counters.control_rejected += 1;
                 return;
@@ -745,10 +1064,11 @@ impl PeerEngine {
                 return;
             }
             self.health = validated_health;
+            self.ping_paths.retain(|(nonce, _)| *nonce != pong.nonce);
             if path_probe && self.selected.is_none() && self.path_session == Some(session_id) {
                 self.selected = Some(source);
                 self.path_probes.clear();
-                self.health.invalidate_endpoint(source);
+                self.health.invalidate_endpoint(source.remote);
                 self.counters.paths_selected += 1;
             }
             return;
@@ -770,8 +1090,9 @@ impl PeerEngine {
             }
             FrameType::CtrlPing => {
                 let ping = control.expect("validated PING");
+                // Only registered return paths may affect health/replay.
                 if let Some(context) = self.path_context(source) {
-                    self.health.on_ping(&ping, source, &context, now_ms);
+                    self.health.on_ping(&ping, source.remote, &context, now_ms);
                 }
                 self.send_pong(source, ping.nonce, ping.path_probe(), now_ms);
             }
@@ -782,16 +1103,26 @@ impl PeerEngine {
     fn process_handshake_events(
         &mut self,
         events: Vec<HandshakeEvent>,
-        source: Option<Endpoint>,
+        source: Option<PathEndpoint>,
         now_ms: u64,
     ) {
         let mut target_hint = None;
         for event in events {
             match event {
-                HandshakeEvent::Send { target, frames } => {
+                HandshakeEvent::Send {
+                    transport,
+                    target,
+                    frames,
+                } => {
+                    let target = PathEndpoint {
+                        transport,
+                        remote: target,
+                    };
                     target_hint = Some(target);
                     for frame in frames {
-                        self.queue_frame(target, frame);
+                        if self.may_source(target) {
+                            self.queue_frame(target, frame);
+                        }
                     }
                 }
                 HandshakeEvent::SessionInstalled { session_id } => {
@@ -802,23 +1133,13 @@ impl PeerEngine {
                         && self.path_session != Some(session_id)
                     {
                         self.path_session = Some(session_id);
+                        self.session_path = source.or(target_hint);
                         self.selected = None;
                         self.health = HealthState::new();
                         self.path_probes.clear();
                         self.counters.sessions_installed += 1;
-                        if let Some(source) = source {
-                            self.queue_path_target(source);
-                        }
-                        if let Some(target) = target_hint {
-                            self.queue_path_target(target);
-                        }
-                        let candidates = self
-                            .candidates
-                            .iter()
-                            .map(|candidate| candidate.endpoint)
-                            .collect::<Vec<_>>();
-                        for candidate in candidates {
-                            self.queue_path_target(candidate);
+                        if let Some(winner) = self.session_path {
+                            self.queue_path_target(winner);
                         }
                     }
                 }
@@ -839,23 +1160,30 @@ impl PeerEngine {
     fn drive_handshake(&mut self, now_ms: u64) {
         match self.role {
             Role::Initiator => {
-                if self.hs.pending_attempts() != 0 {
-                    return;
-                }
                 let targets = self
                     .candidates
                     .iter()
-                    .map(|candidate| candidate.endpoint)
+                    .map(|candidate| candidate.path)
                     .collect::<Vec<_>>();
                 for target in targets {
-                    match self.hs.start_attempt(target, now_ms) {
+                    if self.hs.has_attempt_on(target.transport, target.remote)
+                        || self.udp_out.len() >= MAX_UDP_OUTBOX
+                        || !self.probe_budget.allow(target, now_ms)
+                    {
+                        continue;
+                    }
+                    match self
+                        .hs
+                        .start_attempt_on(target.transport, target.remote, now_ms)
+                    {
                         Ok(events) => self.process_handshake_events(events, None, now_ms),
                         Err(_) => self.counters.handshake_rejected += 1,
                     }
                 }
             }
             Role::Responder => {
-                for index in 0..self.candidates.len() {
+                for offset in 0..self.candidates.len() {
+                    let index = (offset + self.responder_cursor) % self.candidates.len();
                     let due = self.candidates[index].last_probe_ms.is_none_or(|last| {
                         now_ms.saturating_sub(last) >= RESPONDER_PROBE_INTERVAL_MS
                     });
@@ -863,13 +1191,21 @@ impl PeerEngine {
                         continue;
                     }
                     self.candidates[index].last_probe_ms = Some(now_ms);
-                    self.send_responder_probe(self.candidates[index].endpoint, now_ms);
+                    self.send_responder_probe(self.candidates[index].path, now_ms);
                 }
+                self.responder_cursor = if self.candidates.is_empty() {
+                    0
+                } else {
+                    (self.responder_cursor % self.candidates.len() + 1) % self.candidates.len()
+                };
             }
         }
     }
 
-    fn send_responder_probe(&mut self, target: Endpoint, now_ms: u64) {
+    fn send_responder_probe(&mut self, target: PathEndpoint, now_ms: u64) {
+        if !self.probe_budget.allow(target, now_ms) {
+            return;
+        }
         let mut nonce = [0u8; 32];
         if getrandom::fill(&mut nonce).is_err() {
             self.counters.control_rejected += 1;
@@ -901,16 +1237,17 @@ impl PeerEngine {
         }
     }
 
-    fn queue_path_target(&mut self, endpoint: Endpoint) {
+    fn queue_path_target(&mut self, path: PathEndpoint) {
         let Some(session_id) = self.path_session else {
             return;
         };
         if self.selected.is_some()
-            || !self.may_target(endpoint)
+            || self.session_path != Some(path)
+            || !self.may_source(path)
             || self
                 .path_probes
                 .iter()
-                .any(|probe| probe.endpoint == endpoint && probe.session_id == session_id)
+                .any(|probe| probe.path == path && probe.session_id == session_id)
         {
             return;
         }
@@ -918,7 +1255,7 @@ impl PeerEngine {
             return;
         }
         self.path_probes.push(PathProbeState {
-            endpoint,
+            path,
             session_id,
             next_probe_ms: 0,
             sent: 0,
@@ -940,7 +1277,7 @@ impl PeerEngine {
             if !due {
                 continue;
             }
-            let endpoint = probe.endpoint;
+            let endpoint = probe.path;
             let sent = self.send_ping(endpoint, true, now_ms);
             let probe = &mut self.path_probes[index];
             probe.next_probe_ms = now_ms.saturating_add(PATH_PROBE_INTERVAL_MS);
@@ -964,8 +1301,11 @@ impl PeerEngine {
         }
     }
 
-    fn send_ping(&mut self, target: Endpoint, path_probe: bool, now_ms: u64) -> bool {
-        if !self.health.has_room() {
+    fn send_ping(&mut self, target: PathEndpoint, path_probe: bool, now_ms: u64) -> bool {
+        if !self.health.has_room() || self.session_path != Some(target) {
+            return false;
+        }
+        if path_probe && !self.probe_budget.allow(target, now_ms) {
             return false;
         }
         let mut nonce = [0u8; 32];
@@ -995,7 +1335,7 @@ impl PeerEngine {
         self.health.register_sent(
             PendingPing {
                 nonce,
-                endpoint: target,
+                endpoint: target.remote,
                 boot_id: self.boot_id,
                 peer_boot_id: session.peer_boot_id,
                 generation: self.generation,
@@ -1007,10 +1347,20 @@ impl PeerEngine {
             now_ms,
         );
         self.counters.pings_sent += 1;
+        if self.ping_paths.len() >= 64 {
+            self.ping_paths.pop_front();
+        }
+        self.ping_paths.push_back((nonce, target));
         true
     }
 
-    fn send_pong(&mut self, target: Endpoint, nonce: [u8; 32], echo_path_probe: bool, now_ms: u64) {
+    fn send_pong(
+        &mut self,
+        target: PathEndpoint,
+        nonce: [u8; 32],
+        echo_path_probe: bool,
+        now_ms: u64,
+    ) {
         let payload = CtrlPayload {
             sender: self.self_key,
             receiver: self.peer_key,
@@ -1044,18 +1394,24 @@ impl PeerEngine {
         if !exhausted && !confirmation_timed_out && !offline {
             return false;
         }
+        self.invalidate_session();
+        true
+    }
+
+    fn invalidate_session(&mut self) {
         self.hs.reset();
         self.path_session = None;
+        self.session_path = None;
         self.selected = None;
         self.path_probes.clear();
         self.health = HealthState::new();
+        self.ping_paths.clear();
         self.udp_out.clear();
         self.ipv4_in.clear();
         for candidate in &mut self.candidates {
             candidate.last_probe_ms = None;
         }
         self.counters.reconnects += 1;
-        true
     }
 }
 

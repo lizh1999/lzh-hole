@@ -13,7 +13,13 @@
 - ntfy 只承载有界、Ed25519 签名的联系记录，不承载业务 IP 包、PSK 或私钥。
 - VIP、双方公钥和 relationship ID 只来自 finalized 配对状态；PSK 只存放在私有 state 目录（目录 0700、文件 0600）。
 - 只使用专用 utun 和对端 VIP 的一条 `/32` host route，不改默认路由、DNS、PF 或现有 VPN。
-- STUN、握手、健康检查和业务 UDP 复用同一个绑定物理接口的 socket。
+- 最多保留 8 个绑定真实物理接口＋IPv4 的 socket；每个 socket 的 STUN、握手、健康检查和业务 UDP 复用同一描述符。
+
+## 自动发现
+
+默认开启 `[lan] enabled = true`（旧配置可直接加载）。同网段通过接口隔离的 Bonjour `_lzh-hole._udp.local.` 发现对端，仅广播版本、公钥和实际绑定地址；候选必须匹配已配对公钥、A 记录及真实 RFC1918 子网/直连路由。LAN 冷启动不依赖默认路由、STUN 或 ntfy。
+
+公网仍使用 STUN＋ntfy。新候选优先尝试 LAN，已有健康公网路径保持稳定；最终只使用认证握手及当前路径 PONG 确认的一条路径。Bonjour、公网信令或 STUN 故障不重建其他健康 transport。真实换网与公网 P0 仍待验收，当前限制见 [已知问题](doc/status.md)。
 
 ## 结构
 
@@ -22,8 +28,8 @@ crates/
 ├── lzh-hole-types/      共享领域类型
 ├── lzh-hole-store/      身份、配对、私密持久化、durable seq
 ├── lzh-hole-protocol/   sans-I/O 协议与 PeerEngine
-├── lzh-hole-discovery/  ntfy 信令、签名记录、候选、STUN、限流
-├── lzh-hole-net/        macOS 接口、UDP socket、utun、routes
+├── lzh-hole-discovery/  LAN/Public 发现模型、签名记录、STUN、ntfy、限流
+├── lzh-hole-net/        macOS 接口、Bonjour、UDP socket、utun、routes
 ├── lzh-hole-control/    私有 Unix socket doctor
 ├── lzh-hole-service/    配置、daemon、lifecycle、组件编排
 └── lzh-hole/            CLI：init / pair / daemon / doctor

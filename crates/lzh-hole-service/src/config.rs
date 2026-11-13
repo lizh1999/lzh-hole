@@ -36,6 +36,25 @@ fn default_mtu() -> u16 {
     DEFAULT_MTU
 }
 
+/// Local Bonjour discovery. It never publishes secrets or business packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LanConfig {
+    /// Browse and advertise successfully bound physical UDP endpoints.
+    #[serde(default = "default_lan_enabled")]
+    pub enabled: bool,
+}
+
+fn default_lan_enabled() -> bool {
+    true
+}
+
+impl Default for LanConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// ntfy coordination settings. The topic is not an authentication secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +90,9 @@ pub struct ServiceConfig {
     pub stun_seeds: Vec<SocketAddrV4>,
     /// ntfy carries bounded signed coordination records.
     pub ntfy: NtfyConfig,
+    /// Independent LAN discovery, enabled for legacy configuration files too.
+    #[serde(default)]
+    pub lan: LanConfig,
     /// Tunnel MTU, conservatively capped at 1200.
     #[serde(default = "default_mtu")]
     pub mtu: u16,
@@ -517,6 +539,16 @@ topic = "lzh-example-0123456789abcdef"
             "management_uid = 501\nself_vip = \"10.0.0.9\"",
         );
         assert!(ServiceConfig::from_toml(&with_vip).is_err());
+    }
+
+    #[test]
+    fn lan_defaults_on_and_can_be_explicitly_disabled() {
+        assert!(valid_config().lan.enabled);
+        let disabled = format!("{VALID_TOML}\n[lan]\nenabled = false\n");
+        assert!(!ServiceConfig::from_toml(&disabled).unwrap().lan.enabled);
+        assert!(
+            ServiceConfig::from_toml(&format!("{VALID_TOML}\n[lan]\nunknown = true\n")).is_err()
+        );
     }
 
     #[test]
