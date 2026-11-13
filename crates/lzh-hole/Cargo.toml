@@ -1,0 +1,25 @@
+[package]
+name = "lzh-hole"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Thin CLI for the direct-only two-host IPv4-over-UDP service"
+
+[[bin]]
+name = "lzh-hole"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+lzh-hole-control.workspace = true
+lzh-hole-service.workspace = true
+lzh-hole-store.workspace = true
+lzh-hole-types.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

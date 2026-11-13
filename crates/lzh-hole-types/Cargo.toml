@@ -1,0 +1,22 @@
+[package]
+name = "lzh-hole-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Minimal shared domain types for lzh-hole"
+
+[lints]
+workspace = true
+
+[dependencies]
+base32.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+serde.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

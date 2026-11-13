@@ -1,0 +1,23 @@
+[package]
+name = "lzh-hole-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Identity, pairing and durable private state for lzh-hole"
+
+[lints]
+workspace = true
+
+[dependencies]
+lzh-hole-types.workspace = true
+ed25519-dalek = "3"
+getrandom.workspace = true
+hex.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

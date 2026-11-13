@@ -1,0 +1,28 @@
+# lzh-hole daemon 配置模板。
+# VIP、peer 公钥和 PSK 不得写入本文件；它们只来自 state_dir 中的配对状态。
+state_dir = "/var/db/lzh-hole"
+control_socket = "/var/run/lzh-hole/control.sock"
+
+# 替换为实际管理员 UID（id -u）。root 始终也被 peer_cred 鉴权允许。
+management_uid = 501
+
+# 省略 interface/bind_ip 时自动选择有公网路由的物理接口（推荐）。
+# 仅需固定接口时填写；不要使用 utun/lo0/gif/stf：
+# interface = "en0"
+# 多地址物理接口才设置，且必须是该接口真实持有的 IPv4：
+# bind_ip = "192.168.1.10"
+
+udp_port = 51000
+# 仅接受数值公网 IPv4:port；部署前须确认可用。
+stun_seeds = ["116.162.157.195:3478", "111.206.174.3:3478"]
+# 允许 576–1200。
+mtu = 1200
+
+[ntfy]
+base_url = "https://ntfy.sh"
+# 必须等于 lzh-hole-v1-<relationship_id 的 32 个小写 hex 字符>，防止串用配对关系。
+# topic 不是身份凭据，也不能代替签名认证。
+topic = "lzh-hole-v1-00112233445566778899aabbccddeeff"
+# DNS 返回 Fake-IP 时才设置：把 base_url 的 hostname 解析到该公网 IPv4，
+# 仍保留 HTTPS hostname/SNI/证书校验，不修改系统 DNS/VPN/默认路由。
+# resolve_ip = "159.203.148.75"
