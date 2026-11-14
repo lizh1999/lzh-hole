@@ -39,6 +39,43 @@ pub(super) const PUNCH_RETRY_MIN_MS: u64 = 30_000;
 /// Longest delay between punch attempts.
 pub(super) const PUNCH_RETRY_MAX_MS: u64 = 15 * 60_000;
 
+/// Reserve only this process's soft descriptor budget; never change a hard or
+/// system-wide limit. launchd commonly starts services with a soft limit of 256.
+fn punch_soft_limit(count: usize, limits: &libc::rlimit) -> io::Result<libc::rlim_t> {
+    let required = (count + 128).next_power_of_two() as libc::rlim_t;
+    if limits.rlim_cur >= required {
+        return Ok(limits.rlim_cur);
+    }
+    if limits.rlim_max < required {
+        return Err(io::Error::other(format!(
+            "punch needs RLIMIT_NOFILE >= {required}, hard limit is {}",
+            limits.rlim_max
+        )));
+    }
+    Ok(required)
+}
+
+fn reserve_punch_descriptors(count: usize) -> io::Result<()> {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limits is a live writable rlimit and RLIMIT_NOFILE is valid.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let target = punch_soft_limit(count, &limits)?;
+    if target != limits.rlim_cur {
+        limits.rlim_cur = target;
+        // SAFETY: limits is initialized, the hard limit is unchanged, and the
+        // requested soft limit was checked not to exceed it. Only this process changes.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 pub(super) struct PunchSocket {
     pub id: TransportId,
     pub slot: u16,
@@ -110,6 +147,7 @@ impl PunchSockets {
             return Err(io::Error::other("punch sockets already open"));
         }
         let count = count.clamp(1, PUNCH_HARD_SOCKETS);
+        reserve_punch_descriptors(count)?;
         for slot in 0..count {
             let slot = slot as u16;
             let id = match ids.reserve() {
@@ -839,6 +877,29 @@ mod network_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn punch_descriptor_budget_respects_the_hard_limit_and_never_lowers_a_limit() {
+        let launchd = libc::rlimit {
+            rlim_cur: 256,
+            rlim_max: 1_024,
+        };
+        assert_eq!(punch_soft_limit(PUNCH_HARD_SOCKETS, &launchd).unwrap(), 512);
+        assert_eq!(punch_soft_limit(8, &launchd).unwrap(), 256);
+        let capped = libc::rlimit {
+            rlim_cur: 256,
+            rlim_max: 256,
+        };
+        assert!(punch_soft_limit(PUNCH_HARD_SOCKETS, &capped).is_err());
+        let higher = libc::rlimit {
+            rlim_cur: 4_096,
+            rlim_max: 8_192,
+        };
+        assert_eq!(
+            punch_soft_limit(PUNCH_HARD_SOCKETS, &higher).unwrap(),
+            4_096
+        );
+    }
 
     #[test]
     fn the_token_bucket_refills_by_elapsed_time_and_caps_at_the_burst() {
