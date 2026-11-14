@@ -200,7 +200,7 @@ fn verify_fd(
 
 /// Verify that `path` is a directory we control: not a symlink, mode 0700,
 /// owned by our effective uid.
-fn verify_private_dir(path: &Path) -> Result<(), SecretError> {
+pub(crate) fn verify_private_dir(path: &Path) -> Result<(), SecretError> {
     let meta = fs::symlink_metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             SecretError::UnsafeParent {

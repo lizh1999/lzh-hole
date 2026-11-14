@@ -19,6 +19,7 @@ lzh-hole-service.workspace = true
 lzh-hole-store.workspace = true
 lzh-hole-types.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

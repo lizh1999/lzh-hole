@@ -9,6 +9,7 @@ members = [
     "crates/lzh-hole-control",
     "crates/lzh-hole-service",
     "crates/lzh-hole",
+    "xtask",
 ]
 
 [workspace.package]

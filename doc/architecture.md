@@ -117,6 +117,35 @@ Bonjour 使用 `_lzh-hole._udp.local.`，TXT 为 `v=1`、`pk`、`addr`，SRV por
 
 doctor 返回 `daemon`、`lan`、`ntfy`、`stun`、`session`、`tun`、`routes`、`bytes`、带原因的 `drops`，独立的 `overlay.direct_reachable` / `currently_healthy`，以及 `punch`（`state`、`role`、`local_mapping`、`peer_mapping`、`blocked_by`、`last_failure`、`probes_sent`、`sockets_open`、`hit_port`、`started_unix_ms`；全部是观测值，不代表打洞会成功）。`current_path` 给出实际 transport ID、物理接口、本地/远端 endpoint 与 LAN/Public 类别；`candidates` 有界且不代表在线，`discovery` 计数独立于认证健康。未检测项为 `unknown` / `null`。严格未知字段校验要求 daemon 与 doctor 客户端一起升级。它不包含 `functional_pass` 或 `p0_qualified`，这些由外部验收判断。
 
-## 8. 离线测试范围
+## 8. 构建与离线分发
+
+开发机从项目根目录执行：
+
+~~~sh
+cargo xtask check
+cargo xtask dist
+./dist/install.sh --dry-run
+./dist/install.sh
+~~~
+
+`xtask` 是独立的开发工具 crate，不进入部署包。Cargo alias 固定使用 `--locked --offline`；`check` 执行 release build、fmt、clippy、workspace tests 与四组 CLI help，`dist` 先完整检查，再构建 Apple Silicon macOS 二进制、拒绝非系统动态库依赖，并从 Mach-O 记录最低 macOS 版本。最低版本是构建元数据，不表示已通过跨版本实测。
+
+`dist/` 被 Git 忽略，包含可执行的 `install.sh`、`lzh-hole`、配置与 launchd 模板、当前构建的 `manifest.json`、`SHA256SUMS`，以及只含上述载荷的 tar.gz 和归档校验和。未提交的构建明确标记 `dirty`；不含源码、生产配置或秘密。所有检查与归档成功后才替换上一份 dist；安装端不需要 Rust、Homebrew、Python、jq 或下载依赖。SHA256 只用于完整性检查，不代替可信来源或代码签名。
+
+安装器默认交互确认；非交互执行必须显式传 `--yes`。首次默认只安装二进制与 `/etc/lzh-hole/config.toml.example`，不创建身份、不配对、不安装/启动系统服务、不创建 TUN。按现有运维流程完成身份、配对和生产配置后，首次服务注册/启动必须显式执行并确认：
+
+~~~sh
+./dist/install.sh --enable-service --allow-tun
+~~~
+
+已有且已加载的服务在升级时会短暂重启；未加载的服务保持未加载。已有配置、定制 plist、身份、PSK、durable seq、peer 高水位与 ntfy pacing 不覆盖、不删除。定制的服务路径或参数不符合受支持布局时拒绝自动升级，不静默改写。按当前管理用户实际 UID 配置 `management_uid`，配对后配置对应 relationship 的 ntfy topic，不能直接用示例值启动。
+
+升级先暂存并校验新文件，以 `doctor --preflight --config /etc/lzh-hole/config.toml` 只读检查配置、现有私密目录/文件、身份与配对/topic 一致性。该模式不创建目录、不取 publisher writer 锁、不预留 sequence、不联网，也不输出私钥/PSK。停止旧服务后有界等待旧 PID、control socket、旧 utun 与 peer /32 route 清理，再替换二进制、核对哈希、恢复原服务运行状态。就绪检查要求 daemon/TUN/routes 已初始化，不要求对端在线；安装成功不等于功能或 P0 通过。
+
+失败时自动恢复旧二进制与原服务状态，但不回滚私密状态；清理或回滚失败则明确失败并保留 `/usr/local/libexec/.lzh-hole-install.lock` 内的备份，供人工恢复，不盲删网络资源或绕过 pacing。正常成功/回滚后删除临时备份。并发安装或上次遗留恢复目录会被拒绝。
+
+home4 仍只接收本机生成的二进制，经 `ssh home4` 或 `ssh home-local` 按现有流程部署；本打包工具不包含 SSH 自动部署，不授权上传源码或脚本。
+
+## 9. 离线测试范围
 
 固定 wire/auth/握手向量（`tests/fixtures/wire-v1.json`，格式见[协议](protocol.md)）、PONG 来源/transport/replay、双路径握手唯一赢家、IPv4 分片/VIP、配对与 ntfy 签名字节、私密持久化、STUN 严格解码、LAN 规范化及来源独立撤回/世代隔离、单进程离线 LAN 冷启动/公网故障隔离模拟、真实 loopback socket set/engine + 内存 TUN、doctor 清理。测试不发布组播/公网记录，不访问对端主机、不创建 OS utun、不执行 sudo；原生 Bonjour 双机发现、真实 TCP/UDP/ICMP 和 P0 仍须另行授权验收。

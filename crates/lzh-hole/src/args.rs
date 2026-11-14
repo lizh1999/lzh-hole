@@ -122,6 +122,65 @@ pub(crate) struct DaemonArgs {
 #[derive(Args)]
 pub(crate) struct ControlArgs {
     /// Daemon control socket inside its private directory.
-    #[arg(long)]
-    pub(crate) socket: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "preflight",
+        conflicts_with = "preflight"
+    )]
+    pub(crate) socket: Option<PathBuf>,
+    /// Validate local config and finalized pairing; no network or state writes.
+    #[arg(long, requires = "config")]
+    pub(crate) preflight: bool,
+    /// Configuration to validate in offline preflight mode.
+    #[arg(long, requires = "preflight")]
+    pub(crate) config: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doctor_keeps_socket_mode_and_accepts_explicit_offline_preflight() {
+        assert!(
+            Cli::try_parse_from(["lzh-hole", "doctor", "--socket", "/test/control.sock"]).is_ok()
+        );
+        let args = Cli::try_parse_from([
+            "lzh-hole",
+            "doctor",
+            "--preflight",
+            "--config",
+            "/test/config.toml",
+        ])
+        .unwrap();
+        let Command::Doctor(args) = args.command else {
+            panic!("expected doctor")
+        };
+        assert!(args.preflight);
+        assert!(args.socket.is_none());
+        assert_eq!(
+            args.config.as_deref(),
+            Some(std::path::Path::new("/test/config.toml"))
+        );
+    }
+
+    #[test]
+    fn doctor_rejects_incomplete_or_mixed_modes() {
+        for args in [
+            vec!["lzh-hole", "doctor"],
+            vec!["lzh-hole", "doctor", "--preflight"],
+            vec!["lzh-hole", "doctor", "--config", "/test/config.toml"],
+            vec![
+                "lzh-hole",
+                "doctor",
+                "--preflight",
+                "--config",
+                "/test/config.toml",
+                "--socket",
+                "/test/control.sock",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 }

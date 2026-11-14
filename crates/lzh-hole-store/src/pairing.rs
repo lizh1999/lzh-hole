@@ -485,6 +485,14 @@ impl StateDir {
         })
     }
 
+    /// Open an existing private directory without creating or modifying anything.
+    pub fn open_existing(path: &Path) -> Result<Self, PairingError> {
+        crate::secret::verify_private_dir(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
     /// The directory path.
     #[allow(dead_code, reason = "state-dir introspection; covered by unit tests")]
     pub fn path(&self) -> &Path {

@@ -2,6 +2,7 @@
 //! their respective crates.
 
 mod args;
+mod doctor;
 mod pairing;
 
 use std::process::ExitCode;
@@ -20,6 +21,12 @@ enum AppError {
     Daemon(#[from] DaemonError),
     #[error(transparent)]
     Control(#[from] ControlError),
+    #[error(
+        "offline preflight failed: check configuration, finalized pairing and file permissions"
+    )]
+    Preflight,
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 fn main() -> ExitCode {
@@ -29,16 +36,7 @@ fn main() -> ExitCode {
             Command::Init(args) => pairing::init(&args)?,
             Command::Pair { action } => pairing::run(action)?,
             Command::Daemon(args) => lzh_hole_service::run(args.config, args.allow_tun)?,
-            Command::Doctor(args) => {
-                let response = lzh_hole_service::doctor(&args.socket)?;
-                let failed = matches!(response, lzh_hole_control::ControlResponse::Error { .. });
-                println!("{}", lzh_hole_control::response_json(&response)?);
-                if failed {
-                    ExitCode::from(2)
-                } else {
-                    ExitCode::SUCCESS
-                }
-            }
+            Command::Doctor(args) => doctor::run(&args)?,
         })
     })();
     match result {
