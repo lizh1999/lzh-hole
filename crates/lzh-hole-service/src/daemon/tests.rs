@@ -25,7 +25,7 @@ fn relationship(seed: &[u8; 32]) -> Relationship {
     }
 }
 
-fn resolved_for_test(interface: Option<&str>) -> ResolvedConfig {
+pub(super) fn resolved_for_test(interface: Option<&str>) -> ResolvedConfig {
     let relationship = relationship(&[7u8; 32]);
     ServiceConfig {
         state_dir: PathBuf::from("/var/db/lzh-hole-test"),
@@ -42,6 +42,7 @@ fn resolved_for_test(interface: Option<&str>) -> ResolvedConfig {
         },
         lan: crate::config::LanConfig::default(),
         mtu: 1200,
+        punch: crate::config::PunchConfig::default(),
     }
     .resolve(relationship)
     .unwrap()
@@ -58,7 +59,7 @@ fn physical(name: &str, index: u32, ip: Ipv4Addr) -> InterfaceInfo {
     }
 }
 
-fn offline_daemon() -> (tempfile::TempDir, Daemon) {
+pub(super) fn offline_daemon() -> (tempfile::TempDir, Daemon) {
     let temp = tempfile::tempdir().unwrap();
     let state = StateDir::open(&temp.path().join("state")).unwrap();
     let seed = [7u8; 32];
@@ -100,6 +101,7 @@ fn contact_record_for(
             endpoint: Endpoint::new(Ipv4Addr::new(8, 8, 4, 4), 50_000),
             source: CandidateSource::Stun,
         }],
+        flags: 0,
     }
 }
 
@@ -135,6 +137,7 @@ async fn offline_control_roundtrip() {
         },
         lan: crate::config::LanConfig::default(),
         mtu: 1200,
+        punch: crate::config::PunchConfig::default(),
     };
     let resolved = config.resolve(relationship).unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

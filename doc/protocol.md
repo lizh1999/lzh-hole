@@ -25,6 +25,7 @@
 | k_chal | `Expand(PRK, kdf/challenge ‖ lo_pub ‖ hi_pub ‖ nonce_i ‖ nonce_r ‖ th1, 32)` |
 | k_fin | `Expand(PRK, kdf/finish ‖ lo_pub ‖ hi_pub ‖ nonce_i ‖ nonce_r ‖ th1 ‖ th2, 32)` |
 | k_probe | `Expand(PRK, kdf/probe ‖ lo_pub ‖ hi_pub, 32)`（静态，无 nonce/session） |
+| k_punch | `Expand(PRK, kdf/punch ‖ lo_pub ‖ hi_pub, 32)`（静态，无 nonce/session；与 k_probe 标签不同，不共用 MAC 密钥） |
 | session_id | `Expand(PRK, kdf/session-id ‖ lo_pub ‖ hi_pub ‖ nonce_i ‖ nonce_r ‖ th3, 8)` 作 u64 |
 | k_i2r / k_r2i | `Expand(PRK, kdf/key/i2r 或 kdf/key/r2i ‖ lo_pub ‖ hi_pub ‖ nonce_i ‖ nonce_r ‖ th3, 32)` |
 | th1 | `SHA256(transcript ‖ HELLO 完整帧)` |
@@ -32,7 +33,7 @@
 | th3 | `SHA256(transcript ‖ HELLO ‖ CHALLENGE ‖ FINISH)` |
 | 帧 MAC | `HMAC-SHA256(K, frame-mac ‖ header[0..42] ‖ payload)` |
 
-各帧 MAC 密钥：HELLO→k_hello，CHALLENGE→k_chal，FINISH→k_fin，ACK→k_r2i，PROBE→k_probe，lo→hi 的 PING/PONG/DATA→k_i2r，hi→lo→k_r2i。
+各帧 MAC 密钥：HELLO→k_hello，CHALLENGE→k_chal，FINISH→k_fin，ACK→k_r2i，PROBE→k_probe，PUNCH→k_punch，lo→hi 的 PING/PONG/DATA→k_i2r，hi→lo→k_r2i。
 
 ## 4. 帧格式
 
@@ -50,7 +51,9 @@
 | 32 | 8 | sequence | 每会话每方向独立，从 1 开始 |
 | 40 | 2 | payload_len | |
 
-帧类型：`0x01` HELLO、`0x02` CHALLENGE、`0x03` FINISH、`0x04` ACK、`0x05` PROBE、`0x10` DATA、`0x20` CTRL_PING、`0x21` CTRL_PONG；`0x22` 保留未用。
+帧类型：`0x01` HELLO、`0x02` CHALLENGE、`0x03` FINISH、`0x04` ACK、`0x05` PROBE、`0x10` DATA、`0x20` CTRL_PING、`0x21` CTRL_PONG、`0x22` PUNCH。
+
+PUNCH 与 PROBE 一样是 sessionless（session_id 与 sequence 均为 0）、永不应答、不分配会话状态，但有两点关键差异：**方向不固定**（两个方向都合法，因为硬侧可能是任意一方），且**不写入 `seen_probes` 去重表**（网格扫描会产生数百个 nonce，改由打洞状态机内部的有界 nonce 环去重）。方向合法性由 payload 的 sender 公钥推出：sender 为 lo 时 header direction 必须是 `0`，为 hi 时必须是 `1`。
 
 ### 握手 payload（均为 240 字节，帧长 314）
 
@@ -68,6 +71,19 @@
 0:sender_pubkey(32) 32:receiver_pubkey(32) 64:sender_boot_id(16) 80:sender_generation(8) 88:issued_at_ms(8) 96:probe_nonce(32)。
 
 只由 hi 发往 lo；从不应答、不分配会话状态、不刷新健康、不改变选中路径。`issued_at` 偏离本地时钟超过 120 秒即丢弃。
+
+### PUNCH payload（128 字节，帧长 202，与 PROBE 等长，放大比恰为 1）
+
+| 偏移 | 长度 | 字段 |
+|---|---|---|
+| 0 | 32 | sender_pubkey |
+| 32 | 32 | receiver_pubkey |
+| 64 | 16 | sender_boot_id |
+| 80 | 8 | sender_generation |
+| 88 | 8 | issued_at_ms |
+| 96 | 32 | punch_nonce |
+
+无零填充，128 字节正好用满。`issued_at` 偏离本地时钟超过 120 秒即丢弃。MAC 用 k_punch 覆盖完整 header 与 payload。
 
 ### PING / PONG payload（136 字节，帧长 210）
 
@@ -123,10 +139,22 @@ flags：bit0 = 发送方 local_confirmed；bit1 = path_probe（PONG 回显）；
 | 108 | 16 | boot_id | 每次进程启动的 128-bit 随机值 |
 | 124 | 8 | generation | 同一 boot_id 内单调 |
 | 132 | 1 | candidate_count | 1..=8 |
-| 133 | 1 | flags | `0` |
+| 133 | 1 | flags | 见下 |
 | 134 | 8N | candidates | |
 
 候选：0:ipv4(4) 4:port(2) 6:source_class(1) 7:保留(1，为 0)。v1 只允许两类来源：`0` STUN 实测映射、`1` 已通过当前代际回程挑战的认证 peer-reflexive；没有人工配置类，STUN 服务器地址永远不是候选。候选两两不同。
+
+flags 位（其余位保留，必须为 0，否则整条记录被拒）：
+
+| 位 | 名称 | 含义 |
+|---|---|---|
+| bit0 | `FLAG_MAPPING_EDM` | 发布者 NAT 为 endpoint-dependent mapping，只能当硬侧 |
+| bit1 | `FLAG_MAPPING_UNKNOWN` | 发布者未能分类自己的映射行为，不得为其分配打洞角色 |
+| bit2 | `FLAG_PUNCH_OFFER` | 发布者已开启硬侧打洞窗口；记录 expires_at 不晚于该窗口结束 |
+
+映射位或开窗状态变化需要刷新签名记录，仍遵守公共 HTTP/发布限流。硬侧窗口最多 180 秒，易侧只在有效 offer 剩余时间大于 30 秒时扫描；网格发完不代表响应已经收齐，须继续接收至扫描截止。
+
+两个映射位都不置（`flags` 为 0）表示 endpoint-independent，这也是不支持这些位的旧版本二进制的样子。签名覆盖 flags，篡改即验签失败。
 
 记录规则：
 

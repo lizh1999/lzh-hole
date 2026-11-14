@@ -68,6 +68,49 @@ pub struct NtfyConfig {
     pub resolve_ip: Option<Ipv4Addr>,
 }
 
+/// Largest permitted punch transmission rate.
+pub const MAX_PUNCH_RATE_PER_SECOND: u32 = 1_000;
+/// Default punch transmission rate. A real carrier NAT was measured dropping
+/// confirmations at roughly 20k packets per second while 400 always got
+/// through, so this is deliberately far below any line rate.
+pub const DEFAULT_PUNCH_RATE_PER_SECOND: u32 = 400;
+
+fn default_punch_enabled() -> bool {
+    true
+}
+
+/// Hole-punch tuning. The whole section is optional so an existing
+/// configuration file keeps working unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PunchConfig {
+    /// Whether hole punching may run at all. Turning this off disables the
+    /// whole feature without touching any other setting.
+    #[serde(default = "default_punch_enabled")]
+    pub enabled: bool,
+    /// Punch frames per second, `1..=MAX_PUNCH_RATE_PER_SECOND`.
+    #[serde(default)]
+    pub rate_per_second: Option<u32>,
+}
+
+impl Default for PunchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rate_per_second: None,
+        }
+    }
+}
+
+impl PunchConfig {
+    /// Effective punch transmission rate.
+    pub fn rate_per_second(&self) -> u32 {
+        self.rate_per_second
+            .unwrap_or(DEFAULT_PUNCH_RATE_PER_SECOND)
+            .clamp(1, MAX_PUNCH_RATE_PER_SECOND)
+    }
+}
+
 /// Validated daemon configuration. Secrets and paired addresses are excluded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +139,9 @@ pub struct ServiceConfig {
     /// Tunnel MTU, conservatively capped at 1200.
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// Hole-punch tuning. Absent sections keep the defaults.
+    #[serde(default)]
+    pub punch: PunchConfig,
 }
 
 /// Configuration joined with the one authoritative pairing relationship.

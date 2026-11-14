@@ -9,6 +9,7 @@
 use crate::{
     VerifiedPayload,
     message::RequestId,
+    nat_behavior::{MappingSample, NatProfile, classify_mapping},
     observation::{
         CandidateHint, CandidateScope, DiscoveryOrigin, DiscoveryUpdate, HintSource, ObservationId,
     },
@@ -60,6 +61,10 @@ struct SocketDiscovery {
     pending: Option<PendingStun>,
     next_probe_ms: u64,
     mappings: BTreeMap<Endpoint, u64>,
+    /// Newest mapping observed per STUN server, which is what makes
+    /// endpoint-independent and endpoint-dependent mapping distinguishable.
+    /// Bounded by the server list, which `add_transport` already caps.
+    samples: BTreeMap<SocketAddrV4, MappingSample>,
     consecutive_timeouts: u32,
 }
 
@@ -106,6 +111,7 @@ pub struct PublicDiscovery {
     next_request_ms: u64,
     request_failures: u32,
     advertised_mappings: Vec<(PublicTransportId, Endpoint)>,
+    advertised_flags: u8,
 }
 
 impl Default for PublicDiscovery {
@@ -126,6 +132,7 @@ impl PublicDiscovery {
             next_request_ms: 0,
             request_failures: 0,
             advertised_mappings: Vec::new(),
+            advertised_flags: 0,
         }
     }
 
@@ -151,6 +158,7 @@ impl PublicDiscovery {
                 pending: None,
                 next_probe_ms: now_ms,
                 mappings: BTreeMap::new(),
+                samples: BTreeMap::new(),
                 consecutive_timeouts: 0,
             },
         );
@@ -244,6 +252,18 @@ impl PublicDiscovery {
             socket.mappings.remove(&oldest);
         }
         socket.mappings.insert(response.mapped, expires_at_ms);
+        // Record which destination produced which external port. This is the
+        // only place endpoint-dependent mapping can be told apart from
+        // endpoint-independent mapping, and it costs no extra packet: the
+        // server rotation already queries several destinations in turn.
+        socket.samples.insert(
+            request.server,
+            MappingSample {
+                destination: *request.server.ip(),
+                port: response.mapped.port,
+                observed_at_ms: now_ms,
+            },
+        );
         Ok(Some(PublicMapping {
             transport,
             endpoint: response.mapped,
@@ -271,6 +291,29 @@ impl PublicDiscovery {
 
     pub fn consecutive_timeouts(&self, transport: PublicTransportId) -> Option<u32> {
         self.sockets.get(&transport).map(|s| s.consecutive_timeouts)
+    }
+
+    /// Classify this socket's NAT mapping behaviour from the STUN servers it
+    /// has already been queried against.
+    ///
+    /// Returns `Unknown` until at least two distinct server addresses have
+    /// answered inside the coherence window, which is the honest answer when
+    /// only one seed is configured. No extra socket and no extra packet is
+    /// used: the existing server rotation supplies the samples.
+    pub fn mapping_behavior(&self, transport: PublicTransportId) -> NatProfile {
+        let Some(socket) = self.sockets.get(&transport) else {
+            return NatProfile::unknown();
+        };
+        let samples: Vec<MappingSample> = socket.samples.values().copied().collect();
+        classify_mapping(&samples)
+    }
+
+    /// Every socket's verdict, for diagnostics.
+    pub fn mapping_behaviors(&self) -> Vec<(PublicTransportId, NatProfile)> {
+        self.sockets
+            .keys()
+            .map(|transport| (*transport, self.mapping_behavior(*transport)))
+            .collect()
     }
 
     /// Durably commit high-water state before releasing any candidate hints.
@@ -375,19 +418,20 @@ impl PublicDiscovery {
         }
     }
 
-    /// Call after mapping additions/removals/expiry. Identical refreshes do not
+    /// Call after mapping or coordination flag changes. Identical refreshes do not
     /// accelerate requests. The caller cancels returned correlation, while ntfy
     /// retains its independent persisted pacing/HTTP budget.
-    pub fn request_refresh_needed(&mut self, now_ms: u64) -> Option<RequestId> {
+    pub fn request_refresh_needed(&mut self, now_ms: u64, flags: u8) -> Option<RequestId> {
         let mappings = self
             .own_mappings(now_ms)
             .into_iter()
             .map(|m| (m.transport, m.endpoint))
             .collect::<Vec<_>>();
-        if mappings == self.advertised_mappings {
+        if mappings == self.advertised_mappings && flags == self.advertised_flags {
             return None;
         }
         self.advertised_mappings = mappings;
+        self.advertised_flags = flags;
         self.next_request_ms = self.next_request_ms.min(now_ms);
         self.pending_request.take().map(|pending| pending.id)
     }

@@ -50,6 +50,7 @@ fn payload(seq: u64, ports: &[u16]) -> (SignedPayload, PeerRecordPolicy) {
                 source: CandidateSource::Stun,
             })
             .collect(),
+        flags: 0,
     };
     let signed = SignedPayload::sign(
         MessageKind::Request,
@@ -278,10 +279,47 @@ fn retries_retain_thirty_minute_cap_without_identical_refresh_acceleration() {
             .min(30 * 60_000);
         assert!(!public.request_due(now + delay - 1));
         assert!(public.request_due(now + delay));
-        assert_eq!(public.request_refresh_needed(now + 1), None);
+        assert_eq!(public.request_refresh_needed(now + 1, 0), None);
         assert!(!public.request_due(now + delay - 1));
     }
 }
+#[test]
+fn coordination_changes_refresh_even_when_mappings_do_not_change() {
+    let mut public = PublicDiscovery::new();
+    let second: SocketAddrV4 = "8.8.4.4:3478".parse().unwrap();
+    public.add_transport(1, vec![server(), second], 0);
+    public.start_stun(1, [1; 12], 0).unwrap();
+    public
+        .receive_stun(1, server(), &response([1; 12], endpoint(40_001)), 1)
+        .unwrap();
+    let flags = public.mapping_behavior(1).mapping.record_flags();
+    assert_eq!(flags, crate::record::FLAG_MAPPING_UNKNOWN);
+    public.request_refresh_needed(1, flags);
+    let id = RequestId::from_bytes([1; 16]);
+    assert!(public.request_started(id, NOW + 600_000, NOW, 1));
+    public.request_matched(id, 2);
+    public.start_stun(1, [2; 12], 5_001).unwrap();
+    public
+        .receive_stun(1, second, &response([2; 12], endpoint(40_001)), 5_002)
+        .unwrap();
+    let flags = public.mapping_behavior(1).mapping.record_flags();
+    assert_eq!(flags, 0);
+    public.request_refresh_needed(5_002, flags);
+    assert!(
+        public.request_due(5_002),
+        "UNKNOWN to EIM refreshes a stable mapping"
+    );
+    assert!(public.request_started(id, NOW + 600_000, NOW, 5_002));
+    assert_eq!(
+        public.request_refresh_needed(5_003, crate::record::FLAG_PUNCH_OFFER),
+        Some(id)
+    );
+    assert_eq!(
+        public.request_refresh_needed(5_004, crate::record::FLAG_PUNCH_OFFER),
+        None
+    );
+}
+
 #[test]
 fn actual_mapping_changes_cancel_pending_and_refresh_after_success() {
     let mut public = PublicDiscovery::new();
@@ -290,7 +328,7 @@ fn actual_mapping_changes_cancel_pending_and_refresh_after_success() {
     public
         .receive_stun(1, server(), &response([1; 12], endpoint(40_001)), 1)
         .unwrap();
-    public.request_refresh_needed(1);
+    public.request_refresh_needed(1, 0);
     let id = RequestId::from_bytes([1; 16]);
     assert!(public.request_started(id, NOW + 600_000, NOW, 1));
     public.request_matched(id, 2);
@@ -299,17 +337,17 @@ fn actual_mapping_changes_cancel_pending_and_refresh_after_success() {
     public
         .receive_stun(1, server(), &response([2; 12], endpoint(40_001)), 5_002)
         .unwrap();
-    assert_eq!(public.request_refresh_needed(5_002), None);
+    assert_eq!(public.request_refresh_needed(5_002, 0), None);
     assert!(!public.request_due(5_002));
     public.start_stun(1, [3; 12], 10_002).unwrap();
     public
         .receive_stun(1, server(), &response([3; 12], endpoint(40_002)), 10_003)
         .unwrap();
-    assert_eq!(public.request_refresh_needed(10_003), None);
+    assert_eq!(public.request_refresh_needed(10_003, 0), None);
     assert!(public.request_due(10_003));
     assert!(public.request_started(id, NOW + 600_000, NOW, 10_003));
     public.remove_transport(1);
-    assert_eq!(public.request_refresh_needed(10_004), Some(id));
+    assert_eq!(public.request_refresh_needed(10_004, 0), Some(id));
     assert!(public.request_due(10_004));
-    assert_eq!(public.request_refresh_needed(10_005), None);
+    assert_eq!(public.request_refresh_needed(10_005, 0), None);
 }

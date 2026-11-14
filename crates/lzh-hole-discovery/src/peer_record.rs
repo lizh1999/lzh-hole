@@ -400,6 +400,7 @@ mod tests {
                     source: CandidateSource::Stun,
                 })
                 .collect(),
+            flags: 0,
         }
     }
 

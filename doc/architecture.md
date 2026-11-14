@@ -10,7 +10,7 @@
 crates/
 ├── lzh-hole-types/      最小共享领域类型：身份、Endpoint、配对结果、秘密包装
 ├── lzh-hole-store/      身份初始化、配对、私密持久化、durable seq、peer 高水位、单 writer 锁
-├── lzh-hole-protocol/   sans-I/O 协议：wire、session、握手、crypto、replay、health、path、PeerEngine
+├── lzh-hole-protocol/   sans-I/O 协议：wire、session、握手、crypto、replay、health、path、punch、PeerEngine
 ├── lzh-hole-discovery/  LAN/Public 两个具体发现模型、公共候选更新、ntfy、签名记录、STUN 事务
 ├── lzh-hole-net/        macOS 接口/路由、原生 Bonjour、物理 UDP socket、utun、精确 /32 route
 ├── lzh-hole-control/    私有 Unix socket doctor：DTO、权限、有界帧
@@ -44,7 +44,8 @@ CLI         → service, control, store, types
 - `daemon/mod.rs`：组件构造、事件循环、生命周期输入。
 - `daemon/discovery.rs`：Bonjour/公网模型接线、签名记录、durable seq、请求/回复与 native operation 生命周期。
 - `daemon/candidates.rs`：按 discovery `ObservationId` 合并线索、来源独立撤回、接口世代及 transport 作用域投影；不依赖 control DTO。
-- `daemon/transport.rs`：最多 8 个真实绑定 socket、永不复用的 transport ID、单个持久接收 buffer、轮转 poll。
+- `daemon/transport.rs`：最多 8 个真实绑定 socket、永不复用的 transport ID（与打洞池共用同一分配器）、单个持久接收 buffer、轮转 poll；`adopt` 让打洞获胜 socket 保留原 ID 加入数据面。
+- `daemon/punch.rs`：临时打洞 socket 池（独立临时端口、有界、`Drop` 兜底）、独立令牌桶（默认 400 pps）、触发与角色判定、成功晋升与失败退避。
 - `daemon/dataplane.rs`：按实际 transport 收发，与 TUN 之间转发认证 IPv4。
 - `daemon/lifecycle.rs`：物理接口/所有 IPv4 alias 的选择、5 秒拓扑复查、局部失效与资源清理。
 - `daemon/status.rs`：doctor 快照与有界 drop 计数。
@@ -56,6 +57,7 @@ CLI         → service, control, store, types
 ├─ LAN：Bonjour 发现版本/公钥/实际地址，校验 A 记录交集及接口世代/子网/直连路由
 └─ 公网：各 socket 独立测 STUN → ntfy 交换有界 Ed25519 签名联系记录
 → 合并为 transport-bound 候选，LAN 优先但不抢占已有健康路径
+→ 无健康路径且角色可判定时进入打洞：硬侧（EDM）开 256 个临时 socket 向对端候选发 PUNCH，易侧（EIM）用数据 socket 按步长 128 扫对端 IP 的连续端口块；命中后硬侧获胜 socket 保留原 transport ID 晋升为数据面 socket，易侧把命中端口学成 peer-reflexive 候选
 → 认证握手决定唯一双向路径，再以当前路径 PING/PONG 验证，1024-bit replay window
 → 只有当前 session/endpoint/transport/epoch 匹配的路径承载 DATA
 ```
@@ -65,6 +67,10 @@ CLI         → service, control, store, types
 通信角色由两份公钥的字节序决定，与 `pair offer` 的角色无关。PONG 必须先校验 nonce、实际来源和路径上下文，再提交 replay window；错误来源或未知 nonce 不推进 replay 或健康状态。只有 engine 中当前 session/endpoint/epoch 匹配的 PONG 才能形成 direct/healthy 状态。
 
 Bonjour 使用 `_lzh-hole._udp.local.`，TXT 为 `v=1`、`pk`、`addr`，SRV port 来自成功绑定的 socket。只接受 pinned peer 公钥且 `addr` 出现在同接口 A 记录的 RFC1918 地址；必须属于该 socket 自己的真实子网，并存在非 gateway/reject/default 的同接口直连路由。每个 alias 单独绑定/通告；LAN 不要求 WAN 路由。Public 候选另要求实际同接口公网路由。接口世代、观察时 socket ID 和 native operation ID 隔离迟到事件；TTL/重试使用进程单调时间，wire 时间戳使用 UNIX 时间。
+
+打洞与数据面完全隔离：PUNCH 用独立帧型与独立静态密钥 `k_punch`，有独立 outbox（512 帧）、独立速率预算（令牌桶，默认 400 pps、burst 100）和独立 socket 池；既不占 `ProbeBudget`，也不占 `MAX_UDP_OUTBOX`，不进 transcript、replay window 或任何序号空间。硬侧 socket 数（256）与易侧网格步长（128）是必须成对的协议常量——块宽不足步长两倍时网格会整块跨过，因此不暴露为配置项。PUNCH 绝不写入 `seen_probes`。
+
+打洞只在**没有健康路径**时启动，由 `start_punch` 单点强制；EDM↔EDM、任一侧映射行为未知、无公网候选、ntfy 阻塞期或退避期内均不启动，并在 doctor 中如实给出原因。硬侧窗口最多 180 秒以容纳限流发布和传播；开窗/关窗及映射分类变化都会刷新签名记录但不绕过 ntfy pacing。开窗记录过期时间不晚于实际窗口结束，易侧仅在收到仍有完整 30 秒扫描时间的有效 offer 后启动，网格发完后继续等待在途确认直至截止。命中时丢弃旧扫描队列，硬侧 slot 0 与易侧数据 slot 0 按角色分别解析；晋升 socket 有 30 秒握手宽限，未建链或失效后自动回收。失败一律如实离线，不降级、不兜底。
 
 候选刷新保留未变路径的定时器。记录过期只撤销后续尝试资格，不终止健康会话；socket 消失才失效其路径。一侧发现可由认证 PROBE/入站握手完成连接；PROBE nonce 在有效期内有界去重，学习候选有效 120 秒。主动 HELLO/重传、PROBE、路径 PING 共用每关系 10/s、每路径 2/s 的滑动预算；正常健康、DATA 和有独立边界的认证即时回复不占主动探测预算。
 
@@ -102,13 +108,14 @@ Bonjour 使用 `_lzh-hole._udp.local.`，TXT 为 `v=1`、`pk`、`addr`，SRV por
 - 接口、所有 IPv4 alias/真实掩码和路由每 5 秒复查。自动模式优先同接口公网路由，然后失败计数/index；LAN 开启时保留无 WAN 路由的物理接口。显式 `interface`/`bind_ip` 严格限定候选，最多成功绑定 8 个 sockets。
 - 只移除实际消失或接收失败的 transport，其他 sockets/session 不全局重建。STUN/ntfy/Bonjour 故障独立退避，不作为 socket 消失证据。启动时没有可用物理接口也保留 daemon/control，等待后续拓扑恢复。
 - Bonjour native refs/events、候选、重试和队列都有上限；接口撤销立即取消相应注册/浏览。native 扫描期限跨 select 取消保留，单条坏记录不取消其他服务；持续 PTR 存在时有界重解析补充 TTL。
+- 打洞失败后按 30 秒起、指数至 15 分钟退避重试；接口消失立即关闭该接口上的全部打洞 socket 并取消进行中的尝试。晋升失败（如 8 个 transport 已满）时关闭打洞 socket 并如实报告，绝不驱逐正在工作的数据面 socket。
 - 没有手动 reconnect 命令；离线测试通过测试专用组件注入。
 
 ## 7. 控制接口
 
 私有 Unix socket，一行一个 JSON、每连接一个请求、最大 16 KiB，只接受 `{"command":"doctor"}`。目录 0700、socket 0600，属主为管理 UID，连接后再经 `peer_cred()` 只允许 root 或管理 UID。bind 时路径已存在即失败；正常退出只删除 device/inode 与本次 bind 相符的 socket。
 
-doctor 返回 `daemon`、`lan`、`ntfy`、`stun`、`session`、`tun`、`routes`、`bytes`、带原因的 `drops`，以及独立的 `overlay.direct_reachable` / `currently_healthy`。`current_path` 给出实际 transport ID、物理接口、本地/远端 endpoint 与 LAN/Public 类别；`candidates` 有界且不代表在线，`discovery` 计数独立于认证健康。未检测项为 `unknown` / `null`。严格未知字段校验要求 daemon 与 doctor 客户端一起升级。它不包含 `functional_pass` 或 `p0_qualified`，这些由外部验收判断。
+doctor 返回 `daemon`、`lan`、`ntfy`、`stun`、`session`、`tun`、`routes`、`bytes`、带原因的 `drops`，独立的 `overlay.direct_reachable` / `currently_healthy`，以及 `punch`（`state`、`role`、`local_mapping`、`peer_mapping`、`blocked_by`、`last_failure`、`probes_sent`、`sockets_open`、`hit_port`、`started_unix_ms`；全部是观测值，不代表打洞会成功）。`current_path` 给出实际 transport ID、物理接口、本地/远端 endpoint 与 LAN/Public 类别；`candidates` 有界且不代表在线，`discovery` 计数独立于认证健康。未检测项为 `unknown` / `null`。严格未知字段校验要求 daemon 与 doctor 客户端一起升级。它不包含 `functional_pass` 或 `p0_qualified`，这些由外部验收判断。
 
 ## 8. 离线测试范围
 

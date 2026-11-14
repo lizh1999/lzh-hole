@@ -33,6 +33,7 @@ use lzh_hole_protocol::engine::{
 };
 use lzh_hole_protocol::handshake::HandshakeConfig;
 use lzh_hole_protocol::path::{LanSubnet, PathCandidate, TransportPolicy};
+use lzh_hole_protocol::punch::PUNCH_BURST;
 use lzh_hole_store::{FileLock, HighWaterError, PeerRecordCache};
 use lzh_hole_types::{BootId, DiscoveryPublicKey, Secret32, TransportId};
 use tokio::sync::{mpsc, watch};
@@ -42,8 +43,8 @@ use tokio::time::{Instant, interval_at, timeout};
 use crate::config::{ConfigError, ResolvedConfig, ServiceConfig};
 use lzh_hole_control::{
     ByteCounters, COMMAND_CHANNEL_CAPACITY, ComponentState, ComponentStatus, ControlConfig,
-    ControlError, ControlResponse, ControlServer, DaemonState, DropCounters, ServiceCommand,
-    ServiceSnapshot,
+    ControlError, ControlResponse, ControlServer, DaemonState, DropCounters, PunchStatus,
+    ServiceCommand, ServiceSnapshot,
 };
 use lzh_hole_discovery::{
     Delivery, ExchangeAction, ExchangeTracker, MessageKind, NtfyConfig, NtfyError, NtfyEvent,
@@ -57,13 +58,15 @@ mod candidates;
 mod dataplane;
 mod discovery;
 mod lifecycle;
+mod punch;
 mod status;
 mod transport;
 
 use candidates::{CandidateRegistry, CandidateTransport};
 use discovery::{MdnsOperation, NtfyBlock};
+use punch::{PunchBlock, PunchDatagram, PunchSockets, TokenBucket};
 use status::component;
-use transport::{TransportDatagram, TransportSet};
+use transport::{TransportDatagram, TransportIds, TransportSet};
 
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const RECOVERY_RETRY: Duration = Duration::from_secs(5);
@@ -269,6 +272,28 @@ struct Daemon {
     exchange: ExchangeTracker,
     network_enabled: bool,
     transports: TransportSet,
+    /// One identifier space for the data plane and the punch pool alike.
+    transport_ids: TransportIds,
+    punch_sockets: PunchSockets,
+    punch_bucket: TokenBucket,
+    punch_block: Option<PunchBlock>,
+    punch_failure: Option<String>,
+    punch_started_ms: Option<u64>,
+    punch_hit_port: Option<u16>,
+    punch_backoff_ms: u64,
+    next_punch_attempt_ms: u64,
+    /// The socket the punch role decision was based on, pinned for the whole
+    /// attempt so the scan cannot drift onto a differently-behaving socket.
+    punch_origin_transport: Option<TransportId>,
+    /// A punch slot whose socket already joined the data plane. Its
+    /// confirmations are still addressed to it.
+    promoted_slot: Option<(u16, TransportId)>,
+    /// Promoted sockets get a bounded handshake grace period, then must own a path.
+    promoted_transports: BTreeMap<TransportId, u64>,
+    punch_send_failures: u32,
+    /// Coordination flags from the peer's last accepted contact record.
+    peer_record_flags: u8,
+    peer_record_expires_ms: u64,
     interface_failures: BTreeMap<String, u64>,
     engine: Option<PeerEngine>,
     registry: CandidateRegistry,
@@ -412,6 +437,21 @@ impl Daemon {
             exchange: ExchangeTracker::default(),
             network_enabled,
             transports: TransportSet::default(),
+            transport_ids: TransportIds::default(),
+            punch_sockets: PunchSockets::default(),
+            punch_bucket: TokenBucket::new(PUNCH_BURST, PUNCH_BURST, 0),
+            punch_block: None,
+            punch_failure: None,
+            punch_started_ms: None,
+            punch_hit_port: None,
+            punch_backoff_ms: punch::PUNCH_RETRY_MIN_MS,
+            next_punch_attempt_ms: 0,
+            punch_origin_transport: None,
+            promoted_slot: None,
+            promoted_transports: BTreeMap::new(),
+            punch_send_failures: 0,
+            peer_record_flags: 0,
+            peer_record_expires_ms: 0,
             interface_failures: BTreeMap::new(),
             engine,
             registry: CandidateRegistry::default(),
@@ -477,6 +517,7 @@ impl Daemon {
                 command = commands.recv() => LoopEvent::Command(command),
                 ntfy = next_ntfy(&mut self.ntfy_events) => LoopEvent::Ntfy(ntfy),
                 udp = self.transports.recv() => LoopEvent::Udp(udp),
+                punch = self.punch_sockets.recv() => LoopEvent::Punch(punch),
                 mdns = next_mdns(&mut self.mdns) => LoopEvent::Mdns(mdns),
                 tun = recv_tun(self.tunnel.as_ref(), self.resolved.config.mtu) => LoopEvent::Tun(tun),
                 _ = tokio::signal::ctrl_c() => LoopEvent::Stop,
@@ -501,10 +542,16 @@ impl Daemon {
                 }
                 LoopEvent::Ntfy(Some(event)) => self.handle_ntfy(event).await,
                 LoopEvent::Udp(udp) => self.handle_udp(udp).await,
+                LoopEvent::Punch(punch) => {
+                    let now_ms = now_unix_ms();
+                    self.handle_punch_udp(punch, now_ms);
+                }
                 LoopEvent::Mdns(event) => self.handle_mdns(event),
                 LoopEvent::Tun(tun) => self.handle_tun(tun).await,
             }
             self.drain_engine().await;
+            let now_ms = now_unix_ms();
+            self.drain_punch(now_ms).await;
         }
     }
 
@@ -513,6 +560,10 @@ impl Daemon {
         if let Some(engine) = &mut self.engine {
             engine.tick(now_ms);
         }
+        // A punch never starts while a path is healthy; `maybe_start_punch`
+        // enforces that and records why it declined.
+        self.maybe_start_punch(now_ms);
+        self.drive_punch(now_ms);
         let now = self.monotonic_ms();
         let expired = self.public.expire(now);
         if let Some(id) = expired.expired_request {
@@ -554,6 +605,7 @@ enum LoopEvent {
     Command(Option<ServiceCommand>),
     Ntfy(Option<NtfyEvent>),
     Udp(TransportDatagram),
+    Punch(PunchDatagram),
     Mdns(std::io::Result<MdnsEvent>),
     Tun(TunEvent),
 }

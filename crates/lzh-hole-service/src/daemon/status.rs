@@ -12,6 +12,7 @@ impl Daemon {
             self.last_healthy_unix_ms = Some(now);
         }
         self.snapshot.updated_unix_ms = now;
+        self.snapshot.punch = self.punch_status();
         self.snapshot.stun = if !self.network_enabled {
             component(
                 ComponentState::NotConfigured,

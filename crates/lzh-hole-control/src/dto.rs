@@ -188,6 +188,33 @@ pub struct DiscoveryCounters {
     pub withdrawals: u64,
 }
 
+/// Hole-punch state. Every field is an observation, never a promise that a
+/// punch will succeed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PunchStatus {
+    /// Attempt phase, or `idle` when nothing is running.
+    pub state: String,
+    /// Which side this host is playing, when an attempt is running.
+    pub role: Option<String>,
+    /// This host's own measured mapping behaviour.
+    pub local_mapping: String,
+    /// The peer's mapping behaviour as published in its last accepted record.
+    pub peer_mapping: String,
+    /// Why no attempt is running, when one was considered and declined.
+    pub blocked_by: Option<String>,
+    /// Why the last attempt ended without a path.
+    pub last_failure: Option<String>,
+    /// Punch frames handed to the kernel during the current attempt.
+    pub probes_sent: u64,
+    /// Punch sockets currently open.
+    pub sockets_open: u16,
+    /// The port that produced a hit, once there is one.
+    pub hit_port: Option<u16>,
+    /// When the current attempt started, on the daemon's UNIX clock.
+    pub started_unix_ms: Option<u64>,
+}
+
 /// Fresh doctor data returned to the local management client.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +239,8 @@ pub struct ServiceSnapshot {
     pub drops: DropCounters,
     /// End-to-end direct-path evidence, independent of daemon Running.
     pub overlay: OverlayHealth,
+    /// Hole-punch state; default is an idle, unclassified snapshot.
+    pub punch: PunchStatus,
     /// Current selected path, including its real physical socket.
     pub current_path: Option<CurrentPathStatus>,
     /// At most 32 eligible transport-bound candidates, not online evidence.

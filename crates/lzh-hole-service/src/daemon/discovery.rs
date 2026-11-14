@@ -54,8 +54,32 @@ pub(super) fn publication_endpoints(
 }
 
 impl Daemon {
+    /// Coordination flags published with the next contact record.
+    ///
+    /// The mapping verdict is this host's own measurement, reduced across every
+    /// retained socket by taking the hardest one. The punch offer bit is only
+    /// set while a punch window is actually open, so a peer never scans an
+    /// address that has no sockets behind it.
+    pub(super) fn record_flags(&self) -> u8 {
+        let mapping = lzh_hole_discovery::aggregate_mapping(
+            self.public
+                .mapping_behaviors()
+                .into_iter()
+                .map(|(_, profile)| profile.mapping),
+        );
+        let mut flags = mapping.record_flags();
+        if self.punch_offer_active() {
+            flags |= lzh_hole_discovery::record::FLAG_PUNCH_OFFER;
+        }
+        flags
+    }
+
     pub(super) fn refresh_public_request(&mut self) {
-        if let Some(id) = self.public.request_refresh_needed(self.monotonic_ms()) {
+        let flags = self.record_flags();
+        if let Some(id) = self
+            .public
+            .request_refresh_needed(self.monotonic_ms(), flags)
+        {
             self.exchange.cancel_request(id);
         }
     }
@@ -456,7 +480,7 @@ impl Daemon {
         )
     }
 
-    fn ntfy_waiting(&self) -> bool {
+    pub(super) fn ntfy_waiting(&self) -> bool {
         self.ntfy_block
             .as_ref()
             .is_some_and(|block| block.not_before_unix_ms > now_unix_ms())
@@ -515,6 +539,10 @@ impl Daemon {
                 return;
             }
         };
+        // Remember the peer's coordination flags. They are advisory only:
+        // the punch coordinator refuses to act on an unclassified peer.
+        self.peer_record_flags = verified.validated.record.flags;
+        self.peer_record_expires_ms = verified.validated.record.expires_at_unix_ms;
         self.write_ntfy_detail(format!(
             "verified ntfy message {ntfy_id} as {delivery:?}; candidates only, not online evidence"
         ));
@@ -619,7 +647,9 @@ impl Daemon {
         self.state
             .store_sequence(sequence)
             .map_err(|error| error.to_string())?;
-        let expires_at = now.saturating_add(MAX_LIFETIME_MS);
+        let expires_at = self
+            .punch_offer_deadline()
+            .unwrap_or_else(|| now.saturating_add(MAX_LIFETIME_MS));
         let record = ContactRecord {
             relationship_id: self.resolved.relationship.relationship_id,
             sender: self.resolved.relationship.self_public_key,
@@ -630,6 +660,7 @@ impl Daemon {
             boot_id: self.boot_id,
             generation: self.generation,
             candidates,
+            flags: self.record_flags(),
         };
         // No publish queueing or signing happens before the durable reservation above.
         let payload = SignedPayload::sign(kind, id, &record, &self.signing_key)

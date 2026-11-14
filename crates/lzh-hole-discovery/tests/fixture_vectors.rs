@@ -13,7 +13,7 @@ use lzh_hole_protocol::crypto::{
 use lzh_hole_protocol::path::{CandidateSource, Endpoint};
 use lzh_hole_protocol::wire::{
     AckPayload, ChallengePayload, CtrlPayload, Direction, FinishPayload, FrameType, HelloPayload,
-    ProbePayload, encode_frame,
+    ProbePayload, PunchPayload, encode_frame,
 };
 use lzh_hole_types::{BootId, DiscoveryPublicKey, RelationshipId};
 use serde_json::Value;
@@ -77,6 +77,8 @@ struct Built {
     finish: Vec<u8>,
     ack: Vec<u8>,
     probe: Vec<u8>,
+    punch_lo_to_hi: Vec<u8>,
+    punch_hi_to_lo: Vec<u8>,
     ping: Vec<u8>,
     pong: Vec<u8>,
     data: Vec<u8>,
@@ -85,6 +87,7 @@ struct Built {
     k_chal: lzh_hole_protocol::Key32,
     k_fin: lzh_hole_protocol::Key32,
     k_probe: lzh_hole_protocol::Key32,
+    k_punch: lzh_hole_protocol::Key32,
     k_i2r: lzh_hole_protocol::Key32,
     k_r2i: lzh_hole_protocol::Key32,
     th1: [u8; 32],
@@ -111,6 +114,8 @@ fn build() -> Built {
     let igen = num(&f, "inputs", "initiator_generation");
     let rgen = num(&f, "inputs", "responder_generation");
     let probe_nonce = bytes32(&f, "inputs", "probe_nonce");
+    let punch_nonce = bytes32(&f, "inputs", "punch_nonce");
+    let t_punch_ms = num(&f, "inputs", "t_punch_ms");
     let ping_nonce = bytes32(&f, "inputs", "ping_nonce");
 
     let lo_b = *lo.as_bytes();
@@ -243,6 +248,45 @@ fn build() -> Built {
         &k_probe,
     )
     .expect("probe encodes");
+
+    // A punch frame may travel either way, so both directions are pinned.
+    let k_punch = prk.punch_key(&lo_b, &hi_b);
+    let punch_lo_to_hi = encode_frame(
+        FrameType::Punch,
+        Direction::LoToHi,
+        rel,
+        0,
+        0,
+        &PunchPayload {
+            sender: lo,
+            receiver: hi,
+            boot_id: iboot,
+            generation: igen,
+            issued_at_unix_ms: t_punch_ms,
+            punch_nonce,
+        }
+        .encode(),
+        &k_punch,
+    )
+    .expect("punch lo->hi encodes");
+    let punch_hi_to_lo = encode_frame(
+        FrameType::Punch,
+        Direction::HiToLo,
+        rel,
+        0,
+        0,
+        &PunchPayload {
+            sender: hi,
+            receiver: lo,
+            boot_id: rboot,
+            generation: rgen,
+            issued_at_unix_ms: t_punch_ms,
+            punch_nonce,
+        }
+        .encode(),
+        &k_punch,
+    )
+    .expect("punch hi->lo encodes");
 
     let ping = encode_frame(
         FrameType::CtrlPing,
@@ -406,6 +450,7 @@ fn build() -> Built {
         boot_id: rboot,
         generation: rgen,
         candidates,
+        flags: 0,
     };
     let record_body = record.encode_body().expect("record body encodes");
 
@@ -425,6 +470,8 @@ fn build() -> Built {
         finish,
         ack,
         probe,
+        punch_lo_to_hi,
+        punch_hi_to_lo,
         ping,
         pong,
         data,
@@ -433,6 +480,7 @@ fn build() -> Built {
         k_chal,
         k_fin,
         k_probe,
+        k_punch,
         k_i2r,
         k_r2i,
         th1,
@@ -457,6 +505,7 @@ fn derived_keys_match_the_fixture() {
         ("k_chal", &b.k_chal),
         ("k_fin", &b.k_fin),
         ("k_probe", &b.k_probe),
+        ("k_punch", &b.k_punch),
         ("k_i2r", &b.k_i2r),
         ("k_r2i", &b.k_r2i),
     ] {
@@ -476,15 +525,64 @@ fn derived_keys_match_the_fixture() {
 }
 
 #[test]
+fn punch_frames_are_pinned_in_both_directions_without_amplification() {
+    let f = fixture();
+    let b = build();
+    // Both directions exist, carry the sender's own role in the header, and
+    // are exactly probe-sized so a punch never amplifies.
+    assert_eq!(b.punch_lo_to_hi[5], 0x22, "punch frame type byte");
+    assert_eq!(b.punch_lo_to_hi[6], 0, "lo->hi punch direction byte");
+    assert_eq!(b.punch_hi_to_lo[6], 1, "hi->lo punch direction byte");
+    assert_eq!(b.punch_lo_to_hi.len(), b.probe.len());
+    assert_eq!(b.punch_hi_to_lo.len(), b.probe.len());
+    // Sessionless: no session id and no sequence.
+    for frame in [&b.punch_lo_to_hi, &b.punch_hi_to_lo] {
+        assert_eq!(
+            &frame[24..40],
+            &[0u8; 16],
+            "session id and sequence must be zero"
+        );
+        assert_eq!(
+            u16::from_be_bytes([frame[40], frame[41]]),
+            128,
+            "payload length"
+        );
+    }
+    // The two directions must not share a MAC, or a replayed frame from one
+    // side could be accepted as the other.
+    let lo_mac = &b.punch_lo_to_hi[b.punch_lo_to_hi.len() - 32..];
+    let hi_mac = &b.punch_hi_to_lo[b.punch_hi_to_lo.len() - 32..];
+    assert_ne!(lo_mac, hi_mac);
+    // The punch key is distinct from the probe key.
+    assert_ne!(b.k_punch.as_bytes(), b.k_probe.as_bytes());
+    assert_eq!(
+        hex::encode(b.k_punch.as_bytes()),
+        text(&f, "expected", "k_punch")
+    );
+    // A punch MAC does not verify under the probe key, so the two frame types
+    // can never be confused for one another.
+    assert_ne!(
+        hex::encode(&b.punch_lo_to_hi[b.punch_lo_to_hi.len() - 32..]),
+        hex::encode(frame_mac(
+            &b.k_probe,
+            &b.punch_lo_to_hi[..42],
+            &b.punch_lo_to_hi[42..b.punch_lo_to_hi.len() - 32],
+        )),
+    );
+}
+
+#[test]
 fn every_frame_matches_the_fixture_byte_for_byte() {
     let f = fixture();
     let b = build();
-    let cases: [(&str, &Vec<u8>); 12] = [
+    let cases: [(&str, &Vec<u8>); 14] = [
         ("HELLO", &b.hello),
         ("CHALLENGE", &b.challenge),
         ("FINISH", &b.finish),
         ("ACK", &b.ack),
         ("PROBE", &b.probe),
+        ("PUNCH_LO_TO_HI", &b.punch_lo_to_hi),
+        ("PUNCH_HI_TO_LO", &b.punch_hi_to_lo),
         ("PING", &b.ping),
         ("PONG", &b.pong),
         ("DATA", &b.data),
@@ -523,6 +621,8 @@ fn frame_lengths_match_the_fixture_and_show_no_amplification() {
         ("FINISH", &b.finish),
         ("ACK", &b.ack),
         ("PROBE", &b.probe),
+        ("PUNCH_LO_TO_HI", &b.punch_lo_to_hi),
+        ("PUNCH_HI_TO_LO", &b.punch_hi_to_lo),
         ("PING", &b.ping),
         ("PONG", &b.pong),
         ("DATA", &b.data),

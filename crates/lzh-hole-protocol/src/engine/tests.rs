@@ -1212,4 +1212,374 @@ mod tests {
         );
         assert!(pair.a.snapshot(START + 20_000).session_id.is_some());
     }
+    // ---- hole punching ----
+
+    const PUNCH_PEER: Ipv4Addr = Ipv4Addr::new(210, 22, 105, 194);
+
+    fn punch_config(
+        role: crate::punch::PunchRole,
+        me: DiscoveryPublicKey,
+        peer: DiscoveryPublicKey,
+        boot: [u8; 16],
+        direction: crate::wire::Direction,
+    ) -> crate::punch::PunchConfig {
+        crate::punch::PunchConfig {
+            role,
+            peer_endpoint: Endpoint::new(PUNCH_PEER, 40_000),
+            local_key: me,
+            peer_key: peer,
+            relationship_id: RelationshipId::from_bytes([9; 16]),
+            boot_id: BootId::from_bytes(boot),
+            generation: 1,
+            direction,
+            hard_sockets: 4,
+        }
+    }
+
+    fn punch_pair() -> (PeerEngine, PeerEngine) {
+        let a = engine(
+            DiscoveryPublicKey::from_bytes([1; 32]),
+            DiscoveryPublicKey::from_bytes([2; 32]),
+            [1; 16],
+            A_VIP,
+            B_VIP,
+        );
+        let b = engine(
+            DiscoveryPublicKey::from_bytes([2; 32]),
+            DiscoveryPublicKey::from_bytes([1; 32]),
+            [2; 16],
+            B_VIP,
+            A_VIP,
+        );
+        (a, b)
+    }
+
+    fn nonces() -> impl FnMut() -> [u8; 32] {
+        let mut n = 0u8;
+        move || {
+            n = n.wrapping_add(1);
+            [n; 32]
+        }
+    }
+
+    #[test]
+    fn start_punch_refuses_a_second_attempt_and_stops_cleanly() {
+        let (mut a, _b) = punch_pair();
+        let config = punch_config(
+            crate::punch::PunchRole::Easy,
+            DiscoveryPublicKey::from_bytes([1; 32]),
+            DiscoveryPublicKey::from_bytes([2; 32]),
+            [1; 16],
+            crate::wire::Direction::LoToHi,
+        );
+        assert!(a.start_punch(config.clone(), START));
+        assert!(a.punch_active());
+        // A second attempt while one is running is refused.
+        assert!(!a.start_punch(config.clone(), START));
+        a.punch_tick(START, &mut nonces());
+        assert!(a.next_punch_frame().is_some());
+        a.stop_punch();
+        assert!(!a.punch_active());
+        assert!(a.next_punch_frame().is_none());
+        assert!(a.take_punch_events().is_empty());
+        // And a fresh attempt is accepted again afterwards.
+        assert!(a.start_punch(config, START));
+    }
+
+    #[test]
+    fn a_peer_punch_frame_promotes_a_slot_and_learns_the_endpoint() {
+        use crate::punch::{PunchEvent, PunchRole};
+        use crate::wire::Direction;
+
+        let (mut a, mut b) = punch_pair();
+        // a is lo and easy; b is hi and hard.
+        assert!(a.start_punch(
+            punch_config(
+                PunchRole::Easy,
+                DiscoveryPublicKey::from_bytes([1; 32]),
+                DiscoveryPublicKey::from_bytes([2; 32]),
+                [1; 16],
+                Direction::LoToHi,
+            ),
+            START,
+        ));
+        assert!(b.start_punch(
+            punch_config(
+                PunchRole::Hard,
+                DiscoveryPublicKey::from_bytes([2; 32]),
+                DiscoveryPublicKey::from_bytes([1; 32]),
+                [2; 16],
+                Direction::HiToLo,
+            ),
+            START,
+        ));
+
+        // The easy side produces a grid frame; both sides derive the same
+        // static punch key from the pinned relationship.
+        a.punch_tick(START, &mut nonces());
+        let frame = a.next_punch_frame().expect("a grid frame");
+        assert_eq!(frame.target.ip, PUNCH_PEER);
+
+        let source = Endpoint::new(PUNCH_PEER, 45_000);
+        let before = b.snapshot(START).candidate_count;
+        let events = b.handle_punch_datagram(2, TransportId(7), source, &frame.bytes, START);
+        assert_eq!(
+            events,
+            vec![PunchEvent::Promote {
+                slot: 2,
+                peer: source
+            }]
+        );
+        // The punch state recorded the hit. Confirmation frames are built on
+        // the next tick, which is the only place holding the caller's RNG.
+        let state = b.punch_state().expect("punch running");
+        assert_eq!(state.hit_port(), Some(45_000));
+        assert!(state.confirm_pending());
+        assert!(
+            b.next_punch_frame().is_none(),
+            "nothing is queued before a tick"
+        );
+        b.punch_tick(START, &mut nonces());
+        let confirm = b.next_punch_frame().expect("a confirmation is queued");
+        assert_eq!(confirm.slot, 2, "from the winning slot");
+        assert_eq!(confirm.target, source, "to the observed source");
+        // The daemon can read the event back out of the queue as well.
+        assert_eq!(
+            b.take_punch_events(),
+            vec![PunchEvent::Promote {
+                slot: 2,
+                peer: source
+            }]
+        );
+        let _ = before;
+        // No session was created and no sequence space was touched.
+        assert!(b.snapshot(START).session_id.is_none());
+    }
+
+    #[test]
+    fn a_punched_path_displaces_a_hint_and_starts_handshake_at_capacity() {
+        use crate::engine::MAX_ENGINE_CANDIDATES;
+        use crate::punch::{PunchEvent, PunchRole};
+        use crate::wire::Direction;
+        let (mut a, mut b) = punch_pair();
+        let old = TransportPolicy {
+            transport: TransportId(1),
+            local_endpoint: Endpoint::new(Ipv4Addr::new(192, 168, 1, 2), 51_000),
+            lan_subnets: Vec::new(),
+        };
+        let winner = TransportPolicy {
+            transport: TransportId(7),
+            local_endpoint: Endpoint::new(Ipv4Addr::new(192, 168, 1, 2), 52_000),
+            lan_subnets: Vec::new(),
+        };
+        a.set_transports(std::slice::from_ref(&old));
+        let hints = (0..MAX_ENGINE_CANDIDATES)
+            .map(|index| PathCandidate {
+                path: PathEndpoint {
+                    transport: old.transport,
+                    remote: Endpoint::new(PUNCH_PEER, 10_000 + index as u16),
+                },
+                kind: PathKind::Public,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(a.set_paths(&hints).accepted, MAX_ENGINE_CANDIDATES);
+        a.tick(START);
+        while a.next_udp_frame().is_some() {}
+        let now = START + 1_001;
+        assert!(a.start_punch(
+            punch_config(
+                PunchRole::Hard,
+                DiscoveryPublicKey::from_bytes([1; 32]),
+                DiscoveryPublicKey::from_bytes([2; 32]),
+                [1; 16],
+                Direction::LoToHi
+            ),
+            now
+        ));
+        assert!(b.start_punch(
+            punch_config(
+                PunchRole::Easy,
+                DiscoveryPublicKey::from_bytes([2; 32]),
+                DiscoveryPublicKey::from_bytes([1; 32]),
+                [2; 16],
+                Direction::HiToLo
+            ),
+            now
+        ));
+        b.punch_tick(now, &mut nonces());
+        let probe = b.next_punch_frame().unwrap();
+        let source = Endpoint::new(PUNCH_PEER, 45_000);
+        assert_eq!(
+            a.handle_punch_datagram(2, winner.transport, source, &probe.bytes, now),
+            vec![PunchEvent::Promote {
+                slot: 2,
+                peer: source
+            }]
+        );
+        a.set_transports(&[old, winner]);
+        assert_eq!(a.snapshot(now).candidate_count, MAX_ENGINE_CANDIDATES);
+        a.tick(now);
+        let frames = std::iter::from_fn(|| a.next_udp_frame()).collect::<Vec<_>>();
+        assert!(frames.iter().any(|frame| frame.transport == TransportId(7)
+            && frame.target == source
+            && parse_frame(&frame.bytes).unwrap().header.frame_type == FrameType::Hello));
+        a.set_paths(&hints);
+        assert_eq!(a.snapshot(now).candidate_count, MAX_ENGINE_CANDIDATES);
+        assert!(
+            a.candidates
+                .iter()
+                .any(|candidate| candidate.path.transport == TransportId(7)),
+            "discovery refresh preserves learned winner"
+        );
+    }
+
+    #[test]
+    fn a_learned_punch_endpoint_becomes_a_bounded_candidate() {
+        use crate::punch::{PunchEvent, PunchRole};
+        use crate::wire::Direction;
+
+        // The easy side learns from a frame arriving on its data socket.
+        let (mut a, mut b) = punch_pair();
+        assert!(a.start_punch(
+            punch_config(
+                PunchRole::Easy,
+                DiscoveryPublicKey::from_bytes([1; 32]),
+                DiscoveryPublicKey::from_bytes([2; 32]),
+                [1; 16],
+                Direction::LoToHi,
+            ),
+            START,
+        ));
+        assert!(b.start_punch(
+            punch_config(
+                PunchRole::Hard,
+                DiscoveryPublicKey::from_bytes([2; 32]),
+                DiscoveryPublicKey::from_bytes([1; 32]),
+                [2; 16],
+                Direction::HiToLo,
+            ),
+            START,
+        ));
+        b.punch_tick(START, &mut nonces());
+        let frame = b.next_punch_frame().expect("a hard-side frame");
+
+        let source = Endpoint::new(PUNCH_PEER, 51_234);
+        let before = a.snapshot(START).candidate_count;
+        // Delivered on the ordinary data socket, so slot 0.
+        let events = a.handle_punch_datagram(0, TransportId(3), source, &frame.bytes, START);
+        assert_eq!(events, vec![PunchEvent::Learned { peer: source }]);
+        assert_eq!(
+            a.snapshot(START).candidate_count,
+            before + 1,
+            "a learned punch endpoint must become a candidate"
+        );
+        // Learning the same endpoint again refreshes rather than duplicates.
+        let mut second = frame.bytes.clone();
+        let last = second.len() - 33;
+        second[last] ^= 0xff;
+        // (a flipped nonce byte invalidates the MAC, so this must be ignored)
+        a.handle_punch_datagram(0, TransportId(3), source, &second, START);
+        assert_eq!(a.snapshot(START).candidate_count, before + 1);
+    }
+
+    #[test]
+    fn punch_never_reaches_the_handshake_or_the_data_path() {
+        use crate::punch::PunchRole;
+        use crate::wire::Direction;
+
+        let (mut a, _b) = punch_pair();
+        // A punch frame with no punch running is dropped without touching any
+        // other subsystem.
+        let garbage = vec![0u8; 202];
+        a.handle_datagram_on(TransportId(1), endpoint(41_003), &garbage, START);
+        let snapshot = a.snapshot(START);
+        assert!(snapshot.session_id.is_none());
+        assert_eq!(snapshot.candidate_count, 0);
+
+        // With a punch running, a forged punch frame is still refused: the
+        // static punch key is not guessable.
+        assert!(a.start_punch(
+            punch_config(
+                PunchRole::Easy,
+                DiscoveryPublicKey::from_bytes([1; 32]),
+                DiscoveryPublicKey::from_bytes([2; 32]),
+                [1; 16],
+                Direction::LoToHi,
+            ),
+            START,
+        ));
+        let forged = {
+            let payload = crate::wire::PunchPayload {
+                sender: DiscoveryPublicKey::from_bytes([2; 32]),
+                receiver: DiscoveryPublicKey::from_bytes([1; 32]),
+                boot_id: BootId::from_bytes([2; 16]),
+                generation: 1,
+                issued_at_unix_ms: START,
+                punch_nonce: [0x77; 32],
+            };
+            encode_frame(
+                FrameType::Punch,
+                Direction::HiToLo,
+                RelationshipId::from_bytes([9; 16]),
+                0,
+                0,
+                &payload.encode(),
+                &crate::crypto::Key32::from_bytes([0xab; 32]),
+            )
+            .unwrap()
+        };
+        let events = a.handle_punch_datagram(
+            0,
+            TransportId(3),
+            Endpoint::new(PUNCH_PEER, 51_234),
+            &forged,
+            START,
+        );
+        assert!(events.is_empty(), "a forged punch frame must be refused");
+        assert_eq!(a.snapshot(START).candidate_count, 0);
+        assert!(a.snapshot(START).session_id.is_none());
+    }
+
+    #[test]
+    fn a_learned_punch_endpoint_is_subject_to_the_target_policy() {
+        use crate::punch::PunchRole;
+        use crate::wire::Direction;
+
+        let (mut a, mut b) = punch_pair();
+        assert!(a.start_punch(
+            punch_config(
+                PunchRole::Easy,
+                DiscoveryPublicKey::from_bytes([1; 32]),
+                DiscoveryPublicKey::from_bytes([2; 32]),
+                [1; 16],
+                Direction::LoToHi,
+            ),
+            START,
+        ));
+        assert!(b.start_punch(
+            punch_config(
+                PunchRole::Hard,
+                DiscoveryPublicKey::from_bytes([2; 32]),
+                DiscoveryPublicKey::from_bytes([1; 32]),
+                [2; 16],
+                Direction::HiToLo,
+            ),
+            START,
+        ));
+        b.punch_tick(START, &mut nonces());
+        let frame = b.next_punch_frame().expect("a hard-side frame");
+
+        // A punch frame whose source is in a refused range is authenticated
+        // but must not become a target.
+        let reserved = Endpoint::new(Ipv4Addr::new(203, 0, 113, 9), 51_234);
+        let events = a.handle_punch_datagram(0, TransportId(3), reserved, &frame.bytes, START);
+        // A rejected source must not create a hit or queue confirmations.
+        assert!(events.is_empty());
+        assert!(!a.punch_state().unwrap().confirm_pending());
+        assert_eq!(
+            a.snapshot(START).candidate_count,
+            0,
+            "a documentation-range source must never become a candidate"
+        );
+    }
 }

@@ -24,6 +24,7 @@ use crate::path::{
     Endpoint, EndpointReject, PathCandidate, PathEndpoint, PathKind, TransportPolicy, classify,
     validate_remote_target,
 };
+use crate::punch::{PunchConfig, PunchEvent, PunchFrame, PunchState};
 use crate::session::SessionKeys;
 use crate::wire::{
     CtrlPayload, Direction, FrameType, MAX_PAYLOAD_LEN, ParsedFrame, ProbePayload, WireError,
@@ -45,6 +46,11 @@ pub const IPV4_MTU: usize = MAX_PAYLOAD_LEN;
 pub const MAX_PATH_PROBES_PER_ENDPOINT: usize = 8;
 /// A session with no usable health round trip is rebuilt after this interval.
 pub const PATH_CONFIRM_TIMEOUT_MS: u64 = OFFLINE_AFTER_MS;
+
+/// Queued punch events awaiting the daemon. The authoritative punch state
+/// lives in `PunchState`, so overflowing this queue loses a notification but
+/// never a decision.
+const MAX_PUNCH_EVENTS: usize = 16;
 
 const PATH_PROBE_INTERVAL_MS: u64 = 1_000;
 const RESPONDER_PROBE_INTERVAL_MS: u64 = 1_000;
@@ -312,6 +318,8 @@ pub struct PeerEngine {
     transports: Option<Vec<TransportPolicy>>,
     ping_paths: VecDeque<([u8; 32], PathEndpoint)>,
     probe_budget: ProbeBudget,
+    punch: Option<PunchState>,
+    punch_events: VecDeque<PunchEvent>,
     candidates: Vec<CandidateState>,
     path_probes: Vec<PathProbeState>,
     path_session: Option<u64>,
@@ -334,6 +342,7 @@ impl std::fmt::Debug for PeerEngine {
             .field("selected", &self.selected)
             .field("candidates", &self.candidates.len())
             .field("pending_paths", &self.path_probes.len())
+            .field("punch", &self.punch.as_ref().map(PunchState::phase))
             .field("queued_udp", &self.udp_out.len())
             .field("queued_ipv4", &self.ipv4_in.len())
             .field("closed", &self.closed)
@@ -368,6 +377,8 @@ impl PeerEngine {
             transports: None,
             ping_paths: VecDeque::new(),
             probe_budget: ProbeBudget::default(),
+            punch: None,
+            punch_events: VecDeque::new(),
             candidates: Vec::new(),
             path_probes: Vec::new(),
             path_session: None,
@@ -596,6 +607,14 @@ impl PeerEngine {
             self.counters.stale_frames += 1;
             return;
         }
+        // A punch frame is owned entirely by the punch state machine. It never
+        // reaches the handshake, the transcript, the replay window or a
+        // sequence space, and it never allocates session state. Slot 0 is the
+        // ordinary data socket, which is what an easy side scans from.
+        if parsed.header.frame_type == FrameType::Punch {
+            self.handle_punch_datagram(0, transport, remote, datagram, now_ms);
+            return;
+        }
         if parsed.header.frame_type.is_sessionless() {
             if matches!(
                 parsed.header.frame_type,
@@ -614,27 +633,172 @@ impl PeerEngine {
                 && self.role == Role::Initiator
                 && self.hs.session().is_none()
             {
-                if let Some(existing) = self.candidates.iter_mut().find(|c| c.path == source) {
-                    existing.learned_until_ms = Some(now_ms.saturating_add(LEARNED_PATH_TTL_MS));
-                } else if self.candidates.len() < MAX_ENGINE_CANDIDATES {
-                    self.candidates.push(CandidateState {
-                        path: source,
-                        kind: if crate::path::is_private(remote.ip) {
-                            PathKind::Lan
-                        } else {
-                            PathKind::Public
-                        },
-                        last_probe_ms: None,
-                        configured: false,
-                        learned_until_ms: Some(now_ms.saturating_add(LEARNED_PATH_TTL_MS)),
-                    });
-                }
+                self.learn_path(source, now_ms);
             }
             self.process_handshake_events(events, Some(source), now_ms);
         } else {
             self.handle_session_frame(parsed, source, now_ms);
         }
         self.drive_path_probes(now_ms);
+    }
+
+    /// Begin a hole-punch attempt.
+    ///
+    /// Refused whenever a path is already selected or a session exists: a
+    /// punch must never preempt a working path. This is the single place that
+    /// rule is enforced.
+    pub fn start_punch(&mut self, config: PunchConfig, now_ms: u64) -> bool {
+        if self.closed || self.punch.is_some() {
+            return false;
+        }
+        if self.selected.is_some() || self.hs.session().is_some() {
+            return false;
+        }
+        let key = self.hs.punch_key();
+        self.punch = Some(PunchState::new(config, key, now_ms));
+        true
+    }
+
+    /// Whether a punch attempt is running.
+    pub fn punch_active(&self) -> bool {
+        self.punch.is_some()
+    }
+
+    /// Borrow the punch state for diagnostics.
+    pub fn punch_state(&self) -> Option<&PunchState> {
+        self.punch.as_ref()
+    }
+
+    /// Advance the punch state machine. Punch traffic has its own budget and
+    /// never touches `ProbeBudget` or the data outbox.
+    pub fn punch_tick(
+        &mut self,
+        now_ms: u64,
+        nonce: &mut dyn FnMut() -> [u8; 32],
+    ) -> Vec<PunchEvent> {
+        let events = match self.punch.as_mut() {
+            Some(punch) => punch.tick(now_ms, nonce),
+            None => return Vec::new(),
+        };
+        for event in &events {
+            self.push_punch_event(*event);
+        }
+        events
+    }
+
+    /// Take the oldest queued punch frame. The daemon paces these with its own
+    /// token bucket; this engine never decides a transmission rate.
+    pub fn next_punch_frame(&mut self) -> Option<PunchFrame> {
+        self.punch.as_mut().and_then(PunchState::next_frame)
+    }
+
+    /// Feed a datagram that arrived on a punch socket.
+    ///
+    /// Punch sockets are not engine transports, so this is a separate entry
+    /// point from `handle_datagram_on`. The learned endpoint, when one is
+    /// produced, becomes an ordinary candidate subject to the same target
+    /// policy as any other.
+    pub fn handle_punch_datagram(
+        &mut self,
+        slot: u16,
+        transport: TransportId,
+        remote: Endpoint,
+        datagram: &[u8],
+        now_ms: u64,
+    ) -> Vec<PunchEvent> {
+        if self.closed {
+            return Vec::new();
+        }
+        if validate_remote_target(
+            &remote,
+            &self.policy.own_endpoints,
+            &self.policy.forbidden_addresses,
+            &self.policy.stun_servers,
+        )
+        .is_err()
+        {
+            self.counters.wrong_endpoint = self.counters.wrong_endpoint.saturating_add(1);
+            return Vec::new();
+        }
+        let events = match self.punch.as_mut() {
+            Some(punch) => punch.handle_inbound(slot, remote, datagram, now_ms),
+            None => return Vec::new(),
+        };
+        for event in &events {
+            if let PunchEvent::Learned { peer } | PunchEvent::Promote { peer, .. } = event {
+                self.learn_path(
+                    PathEndpoint {
+                        transport,
+                        remote: *peer,
+                    },
+                    now_ms,
+                );
+            }
+        }
+        for event in &events {
+            self.push_punch_event(*event);
+        }
+        events
+    }
+
+    /// Stop any punch attempt and release its state.
+    pub fn stop_punch(&mut self) {
+        if let Some(punch) = self.punch.as_mut() {
+            punch.stop();
+        }
+        self.punch = None;
+        self.punch_events.clear();
+    }
+
+    /// Take queued punch events. Separate from the punch state so a missed
+    /// notification never loses the underlying decision.
+    pub fn take_punch_events(&mut self) -> Vec<PunchEvent> {
+        self.punch_events.drain(..).collect()
+    }
+
+    fn push_punch_event(&mut self, event: PunchEvent) {
+        if self.punch_events.len() >= MAX_PUNCH_EVENTS {
+            self.punch_events.pop_front();
+        }
+        self.punch_events.push_back(event);
+    }
+
+    /// Record a peer-reflexive source as a bounded learned candidate.
+    fn learn_path(&mut self, source: PathEndpoint, now_ms: u64) {
+        if let Some(existing) = self.candidates.iter_mut().find(|c| c.path == source) {
+            existing.learned_until_ms = Some(now_ms.saturating_add(LEARNED_PATH_TTL_MS));
+            return;
+        }
+        if self.candidates.len() >= MAX_ENGINE_CANDIDATES {
+            // Authenticated reachability evidence takes precedence over discovery
+            // hints, but never displaces the installed session's current path.
+            let replaceable = |candidate: &CandidateState| {
+                self.selected != Some(candidate.path) && self.session_path != Some(candidate.path)
+            };
+            let index = self
+                .candidates
+                .iter()
+                .rposition(|candidate| candidate.configured && replaceable(candidate))
+                .or_else(|| self.candidates.iter().rposition(replaceable));
+            let Some(index) = index else {
+                return;
+            };
+            self.candidates.remove(index);
+        }
+        self.candidates.insert(
+            0,
+            CandidateState {
+                path: source,
+                kind: if crate::path::is_private(source.remote.ip) {
+                    PathKind::Lan
+                } else {
+                    PathKind::Public
+                },
+                last_probe_ms: None,
+                configured: false,
+                learned_until_ms: Some(now_ms.saturating_add(LEARNED_PATH_TTL_MS)),
+            },
+        );
     }
 
     /// Advance retransmission, health and failure timers without performing IO.

@@ -52,14 +52,22 @@ impl Daemon {
             })
             .map(|socket| socket.id)
             .collect::<Vec<_>>();
+        let retired_any = !retired.is_empty();
         for id in retired {
             self.retire_transport(id);
         }
+        // An interface disappearing invalidates every punch socket bound to it,
+        // so the attempt is abandoned rather than left holding dead descriptors.
+        if retired_any {
+            self.stop_punch(now_unix_ms());
+        }
         for (name, address) in desired {
-            match self
-                .transports
-                .open(&name, address, self.resolved.config.udp_port)
-            {
+            match self.transports.open(
+                &mut self.transport_ids,
+                &name,
+                address,
+                self.resolved.config.udp_port,
+            ) {
                 Ok(id) => {
                     self.public.add_transport(
                         id.0,
@@ -99,6 +107,18 @@ impl Daemon {
                 }
             }
         }
+        self.sync_engine_transports();
+        self.refresh_public_request();
+        self.reproject_candidates();
+        self.ensure_mdns();
+    }
+
+    /// Publish the current socket set to the engine.
+    ///
+    /// Extracted from `refresh_network` so a promoted punch socket can join
+    /// the data plane without re-enumerating interfaces, retiring transports
+    /// or resetting Bonjour scopes in the middle of a promotion.
+    pub(super) fn sync_engine_transports(&mut self) {
         let policies = self
             .transports
             .iter()
@@ -132,14 +152,12 @@ impl Daemon {
         if let Some(engine) = &mut self.engine {
             engine.set_transports(&policies);
         }
-        self.refresh_public_request();
-        self.reproject_candidates();
-        self.ensure_mdns();
     }
 
     pub(super) fn retire_transport(&mut self, id: TransportId) {
         let index = self.transports.get(id).map(|socket| socket.interface_index);
         if self.transports.remove(id) {
+            self.promoted_transports.remove(&id);
             self.public.remove_transport(id.0);
             if let Some(engine) = &mut self.engine {
                 engine.remove_transport(id);
@@ -263,9 +281,11 @@ impl Daemon {
         if let Some(engine) = &mut self.engine {
             engine.close();
         }
+        self.stop_punch(now_unix_ms());
         self.mdns = None;
         self.mdns_operations.clear();
         self.transports.clear();
+        self.promoted_transports.clear();
         if let Some(tunnel) = self.tunnel.take() {
             if let Err(error) = tunnel.close() {
                 self.tun_status = component(

@@ -20,6 +20,9 @@ pub const FRAME_OVERHEAD: usize = HEADER_LEN + MAC_LEN;
 pub const HANDSHAKE_PAYLOAD_LEN: usize = 240;
 /// PROBE payload length.
 pub const PROBE_PAYLOAD_LEN: usize = 128;
+/// PUNCH payload length. Deliberately identical to PROBE so a punch frame is
+/// exactly as large as a probe frame and no response is ever amplified.
+pub const PUNCH_PAYLOAD_LEN: usize = 128;
 /// PING and PONG payload length.
 pub const CTRL_PAYLOAD_LEN: usize = 136;
 /// Largest permitted DATA payload.
@@ -50,6 +53,9 @@ pub enum FrameType {
     Ack,
     /// Responder keeps its own NAT mapping open. Never answered.
     Probe,
+    /// Hole-punch reachability poke. Either direction, never answered, never
+    /// allocates session state.
+    Punch,
     /// Plaintext IPv4 packet.
     Data,
     /// Health challenge.
@@ -67,6 +73,7 @@ impl FrameType {
             FrameType::Finish => 0x03,
             FrameType::Ack => 0x04,
             FrameType::Probe => 0x05,
+            FrameType::Punch => 0x22,
             FrameType::Data => 0x10,
             FrameType::CtrlPing => 0x20,
             FrameType::CtrlPong => 0x21,
@@ -81,6 +88,7 @@ impl FrameType {
             0x03 => Some(FrameType::Finish),
             0x04 => Some(FrameType::Ack),
             0x05 => Some(FrameType::Probe),
+            0x22 => Some(FrameType::Punch),
             0x10 => Some(FrameType::Data),
             0x20 => Some(FrameType::CtrlPing),
             0x21 => Some(FrameType::CtrlPong),
@@ -99,20 +107,29 @@ impl FrameType {
     /// Whether this frame carries no session, and so must use session_id 0 and
     /// sequence 0.
     pub const fn is_sessionless(self) -> bool {
-        self.is_handshake() || matches!(self, FrameType::Probe)
+        self.is_handshake() || matches!(self, FrameType::Probe | FrameType::Punch)
     }
 
     /// Whether the direction of this frame type is fixed.
+    ///
+    /// PUNCH is sessionless but deliberately excluded: either peer may be the
+    /// hard side, so its direction follows the sender's pinned role and is
+    /// checked against the payload's sender key instead of the frame type.
     pub const fn has_fixed_direction(self) -> bool {
-        self.is_sessionless()
+        self.is_handshake() || matches!(self, FrameType::Probe)
     }
 
     /// The direction this frame type must carry, when fixed.
+    ///
+    /// Only meaningful when [`FrameType::has_fixed_direction`] is true. For
+    /// PUNCH the returned value is a placeholder and must not be relied on;
+    /// derive the expected direction from the payload sender key instead.
     pub const fn required_direction(self) -> Direction {
         match self {
             FrameType::Hello | FrameType::Finish => Direction::LoToHi,
             FrameType::Challenge | FrameType::Ack | FrameType::Probe => Direction::HiToLo,
             FrameType::Data | FrameType::CtrlPing | FrameType::CtrlPong => Direction::LoToHi,
+            FrameType::Punch => Direction::LoToHi,
         }
     }
 
@@ -123,6 +140,7 @@ impl FrameType {
                 Some(HANDSHAKE_PAYLOAD_LEN)
             }
             FrameType::Probe => Some(PROBE_PAYLOAD_LEN),
+            FrameType::Punch => Some(PUNCH_PAYLOAD_LEN),
             FrameType::CtrlPing | FrameType::CtrlPong => Some(CTRL_PAYLOAD_LEN),
             FrameType::Data => None,
         }
@@ -598,6 +616,60 @@ impl ProbePayload {
             generation: u64_at(payload, 80),
             issued_at_unix_ms: u64_at(payload, 88),
             probe_nonce: take(payload, 96),
+        })
+    }
+}
+
+/// PUNCH payload, exactly PUNCH_PAYLOAD_LEN bytes with no padding.
+///
+/// The layout is intentionally identical to ProbePayload. The difference is
+/// that a PUNCH may travel in either direction: the receiver checks the
+/// sender and receiver keys against its own pinned keys and derives the
+/// expected header direction from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PunchPayload {
+    /// Sender public key.
+    pub sender: DiscoveryPublicKey,
+    /// Receiver public key.
+    pub receiver: DiscoveryPublicKey,
+    /// Sender process epoch.
+    pub boot_id: BootId,
+    /// Sender network generation.
+    pub generation: u64,
+    /// Issue time.
+    pub issued_at_unix_ms: u64,
+    /// Fresh nonce, deduplicated by a bounded ring in the punch state machine.
+    pub punch_nonce: [u8; 32],
+}
+
+impl PunchPayload {
+    /// Serialise.
+    pub fn encode(&self) -> [u8; PUNCH_PAYLOAD_LEN] {
+        let mut out = [0u8; PUNCH_PAYLOAD_LEN];
+        out[0..32].copy_from_slice(self.sender.as_bytes());
+        out[32..64].copy_from_slice(self.receiver.as_bytes());
+        out[64..80].copy_from_slice(self.boot_id.as_bytes());
+        out[80..88].copy_from_slice(&self.generation.to_be_bytes());
+        out[88..96].copy_from_slice(&self.issued_at_unix_ms.to_be_bytes());
+        out[96..128].copy_from_slice(&self.punch_nonce);
+        out
+    }
+
+    /// Parse.
+    pub fn decode(payload: &[u8]) -> Result<Self, WireError> {
+        if payload.len() != PUNCH_PAYLOAD_LEN {
+            return Err(WireError::WrongFixedPayloadLen {
+                expected: PUNCH_PAYLOAD_LEN,
+                got: payload.len(),
+            });
+        }
+        Ok(Self {
+            sender: DiscoveryPublicKey::from_bytes(take(payload, 0)),
+            receiver: DiscoveryPublicKey::from_bytes(take(payload, 32)),
+            boot_id: BootId::from_bytes(take(payload, 64)),
+            generation: u64_at(payload, 80),
+            issued_at_unix_ms: u64_at(payload, 88),
+            punch_nonce: take(payload, 96),
         })
     }
 }
@@ -1106,13 +1178,104 @@ mod tests {
             (FrameType::Data, 0x10),
             (FrameType::CtrlPing, 0x20),
             (FrameType::CtrlPong, 0x21),
+            (FrameType::Punch, 0x22),
         ] {
             assert_eq!(ft.as_u8(), byte);
             assert_eq!(FrameType::from_u8(byte), Some(ft));
         }
-        for byte in [0x00u8, 0x06, 0x0f, 0x11, 0x22, 0xff] {
+        for byte in [0x00u8, 0x06, 0x0f, 0x11, 0x23, 0xff] {
             assert_eq!(FrameType::from_u8(byte), None);
         }
+    }
+
+    #[test]
+    fn punch_is_sessionless_without_a_fixed_direction() {
+        assert!(FrameType::Punch.is_sessionless());
+        assert!(!FrameType::Punch.is_handshake());
+        assert!(!FrameType::Punch.has_fixed_direction());
+        assert_eq!(
+            FrameType::Punch.fixed_payload_len(),
+            Some(PUNCH_PAYLOAD_LEN)
+        );
+        // Every other sessionless type keeps its fixed direction.
+        for other in [
+            FrameType::Hello,
+            FrameType::Challenge,
+            FrameType::Finish,
+            FrameType::Ack,
+            FrameType::Probe,
+        ] {
+            assert!(other.has_fixed_direction(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn punch_payload_round_trips_and_rejects_wrong_length() {
+        let punch = PunchPayload {
+            sender: pk(0x00),
+            receiver: pk(0x20),
+            boot_id: boot(0x80),
+            generation: 7,
+            issued_at_unix_ms: 1_762_920_000_500,
+            punch_nonce: [0xd0; 32],
+        };
+        let encoded = punch.encode();
+        assert_eq!(encoded.len(), PUNCH_PAYLOAD_LEN);
+        assert_eq!(PunchPayload::decode(&encoded).unwrap(), punch);
+        // A punch frame is exactly as long as a probe frame: no amplification.
+        assert_eq!(FRAME_OVERHEAD + PUNCH_PAYLOAD_LEN, 202);
+        for bad in [0usize, 127, 129] {
+            assert!(matches!(
+                PunchPayload::decode(&vec![0u8; bad]),
+                Err(WireError::WrongFixedPayloadLen { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn punch_frames_parse_in_either_direction() {
+        let key = crate::crypto::Key32::from_bytes([9u8; 32]);
+        let relationship = RelationshipId::from_bytes([3u8; 16]);
+        let payload = PunchPayload {
+            sender: pk(0x00),
+            receiver: pk(0x20),
+            boot_id: boot(0x80),
+            generation: 1,
+            issued_at_unix_ms: 5,
+            punch_nonce: [7u8; 32],
+        }
+        .encode();
+        for direction in [Direction::LoToHi, Direction::HiToLo] {
+            let frame = encode_frame(
+                FrameType::Punch,
+                direction,
+                relationship,
+                0,
+                0,
+                &payload,
+                &key,
+            )
+            .unwrap();
+            assert_eq!(frame.len(), FRAME_OVERHEAD + PUNCH_PAYLOAD_LEN);
+            let parsed = parse_frame(&frame).unwrap();
+            assert_eq!(parsed.header.frame_type, FrameType::Punch);
+            assert_eq!(parsed.header.direction, direction);
+            assert_eq!(parsed.header.session_id, 0);
+            assert_eq!(parsed.header.sequence, 0);
+        }
+        // A session id on a punch frame is still refused.
+        assert!(matches!(
+            encode_frame(
+                FrameType::Punch,
+                Direction::LoToHi,
+                relationship,
+                1,
+                0,
+                &payload,
+                &key,
+            ),
+            Err(WireError::SessionlessNotZero)
+        ));
     }
 
     #[test]

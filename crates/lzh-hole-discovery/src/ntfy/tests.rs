@@ -27,6 +27,7 @@ fn signed() -> SignedPayload {
             endpoint: Endpoint::new(Ipv4Addr::new(8, 8, 8, 8), 50_000),
             source: CandidateSource::Stun,
         }],
+        flags: 0,
     };
     SignedPayload::sign(
         MessageKind::Request,

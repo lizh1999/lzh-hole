@@ -26,6 +26,18 @@ pub const DEFAULT_LIFETIME_MS: u64 = 600_000;
 /// Hard cap on a record lifetime.
 pub const MAX_LIFETIME_MS: u64 = 3_600_000;
 
+/// flags bit: the publisher's NAT uses endpoint-dependent mapping, so it can
+/// only ever be the hard side of a hole punch.
+pub const FLAG_MAPPING_EDM: u8 = 0b0000_0001;
+/// flags bit: the publisher could not classify its mapping behaviour, so no
+/// punch role may be assigned to it.
+pub const FLAG_MAPPING_UNKNOWN: u8 = 0b0000_0010;
+/// flags bit: the publisher has opened a punch window; its address should be
+/// scanned rather than targeted on the advertised port alone.
+pub const FLAG_PUNCH_OFFER: u8 = 0b0000_0100;
+/// Flag bits that must be zero. A record setting any of them is refused.
+pub const FLAG_RESERVED_MASK: u8 = 0b1111_1000;
+
 /// Why a record could not be built or parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
@@ -57,9 +69,9 @@ pub enum RecordError {
     /// A candidate source class is not publishable.
     #[error("candidate source class {0} is not publishable in v1")]
     UnpublishableSource(u8),
-    /// Flags must be zero.
-    #[error("record flags must be zero")]
-    NonZeroFlags,
+    /// A reserved flag bit was set.
+    #[error("reserved record flag bits set: {0:#04x}")]
+    ReservedFlagBits(u8),
     /// A reserved byte was not zero.
     #[error("non-zero reserved byte at body offset {0}")]
     NonZeroReserved(usize),
@@ -136,6 +148,9 @@ pub struct ContactRecord {
     pub generation: u64,
     /// Candidate endpoints, 1..=8, pairwise distinct.
     pub candidates: Vec<RecordCandidate>,
+    /// Coordination flag bits. Only the named bits may be set; the rest are
+    /// reserved and a record setting one is refused.
+    pub flags: u8,
 }
 
 impl ContactRecord {
@@ -155,7 +170,7 @@ impl ContactRecord {
         out.extend_from_slice(self.boot_id.as_bytes());
         out.extend_from_slice(&self.generation.to_be_bytes());
         out.push(self.candidates.len() as u8);
-        out.push(0);
+        out.push(self.flags);
         for candidate in &self.candidates {
             out.extend_from_slice(&candidate.encode());
         }
@@ -181,8 +196,9 @@ impl ContactRecord {
             return Err(RecordError::BadRecordType(body[3]));
         }
         let count = usize::from(body[132]);
-        if body[133] != 0 {
-            return Err(RecordError::NonZeroFlags);
+        let flags = body[133];
+        if flags & FLAG_RESERVED_MASK != 0 {
+            return Err(RecordError::ReservedFlagBits(flags & FLAG_RESERVED_MASK));
         }
         if count == 0 || count > MAX_CANDIDATES {
             return Err(RecordError::BadCandidateCount(count));
@@ -222,6 +238,7 @@ impl ContactRecord {
             boot_id: BootId::from_bytes(body[108..124].try_into().expect("16")),
             generation: u64::from_be_bytes(body[124..132].try_into().expect("8")),
             candidates,
+            flags,
         };
         record.validate()?;
         Ok(record)
@@ -229,6 +246,11 @@ impl ContactRecord {
 
     /// Structural and policy validation, without any time or signature check.
     pub fn validate(&self) -> Result<(), RecordError> {
+        if self.flags & FLAG_RESERVED_MASK != 0 {
+            return Err(RecordError::ReservedFlagBits(
+                self.flags & FLAG_RESERVED_MASK,
+            ));
+        }
         if self.candidates.is_empty() || self.candidates.len() > MAX_CANDIDATES {
             return Err(RecordError::BadCandidateCount(self.candidates.len()));
         }
@@ -253,6 +275,21 @@ impl ContactRecord {
             return Err(RecordError::LifetimeTooLong(lifetime));
         }
         Ok(())
+    }
+
+    /// Whether the publisher reports endpoint-dependent mapping.
+    pub const fn mapping_edm(&self) -> bool {
+        self.flags & FLAG_MAPPING_EDM != 0
+    }
+
+    /// Whether the publisher could not classify its mapping behaviour.
+    pub const fn mapping_unknown(&self) -> bool {
+        self.flags & FLAG_MAPPING_UNKNOWN != 0
+    }
+
+    /// Whether the publisher has opened a punch window.
+    pub const fn punch_offer(&self) -> bool {
+        self.flags & FLAG_PUNCH_OFFER != 0
     }
 
     /// Whether the record is expired at now_unix_ms.
@@ -375,6 +412,7 @@ mod tests {
                     source: CandidateSource::Stun,
                 },
             ],
+            flags: 0,
         }
     }
 
@@ -410,18 +448,76 @@ mod tests {
     }
 
     #[test]
-    fn flags_and_reserved_bytes_must_be_zero() {
+    fn reserved_flag_bits_and_reserved_bytes_must_be_zero() {
         let mut body = sample().encode_body().unwrap();
-        body[133] = 1;
+        body[133] = FLAG_RESERVED_MASK;
         assert_eq!(
             ContactRecord::decode_body(&body),
-            Err(RecordError::NonZeroFlags)
+            Err(RecordError::ReservedFlagBits(FLAG_RESERVED_MASK))
+        );
+        // A single reserved bit is enough.
+        let mut body = sample().encode_body().unwrap();
+        body[133] = 0b0000_1000;
+        assert_eq!(
+            ContactRecord::decode_body(&body),
+            Err(RecordError::ReservedFlagBits(0b0000_1000))
         );
         let mut body = sample().encode_body().unwrap();
         body[RECORD_FIXED_LEN + 7] = 1;
         assert_eq!(
             ContactRecord::decode_body(&body),
             Err(RecordError::NonZeroReserved(RECORD_FIXED_LEN + 7))
+        );
+    }
+
+    #[test]
+    fn named_flag_bits_round_trip_and_never_disturb_the_body_layout() {
+        let baseline = sample().encode_body().unwrap();
+        for flags in [
+            0u8,
+            FLAG_MAPPING_EDM,
+            FLAG_MAPPING_UNKNOWN,
+            FLAG_PUNCH_OFFER,
+            FLAG_MAPPING_EDM | FLAG_PUNCH_OFFER,
+            FLAG_MAPPING_UNKNOWN | FLAG_PUNCH_OFFER,
+        ] {
+            let mut record = sample();
+            record.flags = flags;
+            let body = record.encode_body().unwrap();
+            // Only the flags byte differs; the layout is untouched.
+            assert_eq!(body.len(), baseline.len());
+            for (index, (a, b)) in body.iter().zip(baseline.iter()).enumerate() {
+                if index != 133 {
+                    assert_eq!(a, b, "byte {index} changed when only flags did");
+                }
+            }
+            let decoded = ContactRecord::decode_body(&body).unwrap();
+            assert_eq!(decoded.flags, flags);
+            assert_eq!(decoded.mapping_edm(), flags & FLAG_MAPPING_EDM != 0);
+            assert_eq!(decoded.mapping_unknown(), flags & FLAG_MAPPING_UNKNOWN != 0);
+            assert_eq!(decoded.punch_offer(), flags & FLAG_PUNCH_OFFER != 0);
+        }
+    }
+
+    #[test]
+    fn a_record_without_flags_still_parses_as_endpoint_independent() {
+        // Backward compatibility: a peer predating these flags sets none, and
+        // an unclassified-but-silent record must not be read as hard.
+        let record = sample();
+        assert_eq!(record.flags, 0);
+        let decoded = ContactRecord::decode_body(&record.encode_body().unwrap()).unwrap();
+        assert!(!decoded.mapping_edm());
+        assert!(!decoded.mapping_unknown());
+        assert!(!decoded.punch_offer());
+    }
+
+    #[test]
+    fn encoding_refuses_reserved_flag_bits_before_signing() {
+        let mut record = sample();
+        record.flags = FLAG_RESERVED_MASK;
+        assert_eq!(
+            record.encode_body(),
+            Err(RecordError::ReservedFlagBits(FLAG_RESERVED_MASK))
         );
     }
 

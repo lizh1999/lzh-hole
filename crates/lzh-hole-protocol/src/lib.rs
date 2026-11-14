@@ -9,6 +9,7 @@ pub mod engine;
 pub mod handshake;
 pub mod health;
 pub mod path;
+pub mod punch;
 pub mod replay;
 pub mod session;
 pub mod wire;
@@ -25,6 +26,11 @@ pub use path::{
     Candidate, CandidateSource, EndpointReject, RejectedCandidate, classify, is_private,
     partition_candidates, validate_publishable, validate_remote_target,
 };
+pub use punch::{
+    GridSequence, PUNCH_DEADLINE_MS, PUNCH_GRID_STEP, PUNCH_HARD_SOCKETS, PUNCH_MAX_PROBES,
+    PUNCH_OUTBOX, PUNCH_RATE_PER_SECOND, PortSequence, PunchConfig, PunchEvent, PunchFailure,
+    PunchFrame, PunchPhase, PunchRole, PunchState,
+};
 pub use replay::{ReplayReject, ReplayWindow};
 pub use session::{Session, SessionKeys};
-pub use wire::{Direction, FrameType, Header, ParsedFrame, WireError};
+pub use wire::{Direction, FrameType, Header, ParsedFrame, PunchPayload, WireError};

@@ -23,6 +23,11 @@ pub const LABEL_KDF_KEY_I2R: &[u8] = b"lzh-hole/v1/kdf/key/i2r";
 pub const LABEL_KDF_KEY_R2I: &[u8] = b"lzh-hole/v1/kdf/key/r2i";
 /// Domain separation label for the static PROBE key.
 pub const LABEL_KDF_PROBE: &[u8] = b"lzh-hole/v1/kdf/probe";
+/// Domain separation label for the static PUNCH key.
+///
+/// Deliberately distinct from [`LABEL_KDF_PROBE`]: the two frame types carry
+/// different payloads and must never share a MAC key.
+pub const LABEL_KDF_PUNCH: &[u8] = b"lzh-hole/v1/kdf/punch";
 /// Prefix for every transcript hash.
 pub const LABEL_TRANSCRIPT: &[u8] = b"lzh-hole/v1/transcript";
 /// Prefix for every frame MAC input.
@@ -96,6 +101,15 @@ impl Prk {
     pub fn probe_key(&self, lo: &[u8; 32], hi: &[u8; 32]) -> Key32 {
         let mut info = Vec::with_capacity(LABEL_KDF_PROBE.len() + 64);
         info.extend_from_slice(LABEL_KDF_PROBE);
+        info.extend_from_slice(lo);
+        info.extend_from_slice(hi);
+        self.expand32(&info)
+    }
+
+    /// The static PUNCH key. Derivable by both sides from pinned keys alone.
+    pub fn punch_key(&self, lo: &[u8; 32], hi: &[u8; 32]) -> Key32 {
+        let mut info = Vec::with_capacity(LABEL_KDF_PUNCH.len() + 64);
+        info.extend_from_slice(LABEL_KDF_PUNCH);
         info.extend_from_slice(lo);
         info.extend_from_slice(hi);
         self.expand32(&info)
@@ -189,6 +203,28 @@ mod tests {
     }
 
     #[test]
+    fn punch_key_is_distinct_from_probe_key_and_both_are_static() {
+        let prk = fixture_prk();
+        let lo = seq(0x00);
+        let hi = seq(0x20);
+        let k_probe = prk.probe_key(&lo, &hi);
+        let k_punch = prk.punch_key(&lo, &hi);
+        // Distinct labels must give distinct keys, or the two frame types would
+        // share a MAC key.
+        assert_ne!(k_probe.as_bytes(), k_punch.as_bytes());
+        // Both are static: no nonce or session input, so both sides derive them
+        // from the pinned keys alone.
+        assert_eq!(prk.punch_key(&lo, &hi).as_bytes(), k_punch.as_bytes());
+        // Role order is part of the input.
+        assert_ne!(prk.punch_key(&hi, &lo).as_bytes(), k_punch.as_bytes());
+        // The probe key is unchanged by this addition.
+        assert_eq!(
+            hex::encode(k_probe.as_bytes()),
+            "e8fe0a6209c0d4b90e535c9d4fa5b08757507554e3cda7e5986e814d772b2cd2"
+        );
+    }
+
+    #[test]
     fn session_id_expansion_is_eight_bytes() {
         let prk = fixture_prk();
         let out = prk.expand8(b"test");
@@ -270,6 +306,7 @@ mod tests {
         assert_eq!(LABEL_KDF_KEY_I2R, b"lzh-hole/v1/kdf/key/i2r");
         assert_eq!(LABEL_KDF_KEY_R2I, b"lzh-hole/v1/kdf/key/r2i");
         assert_eq!(LABEL_KDF_PROBE, b"lzh-hole/v1/kdf/probe");
+        assert_eq!(LABEL_KDF_PUNCH, b"lzh-hole/v1/kdf/punch");
         assert_eq!(LABEL_TRANSCRIPT, b"lzh-hole/v1/transcript");
         assert_eq!(LABEL_FRAME_MAC, b"lzh-hole/v1/frame-mac");
     }

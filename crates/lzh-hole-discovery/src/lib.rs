@@ -8,6 +8,7 @@ pub mod candidate;
 pub mod exchange;
 pub mod lan;
 pub mod message;
+pub mod nat_behavior;
 pub mod ntfy;
 pub mod observation;
 pub mod pacing;
@@ -21,6 +22,10 @@ pub use exchange::{Delivery, ExchangeAction, ExchangeError, ExchangeTracker};
 pub use lan::{LanAdvertisement, LanDiscovery, LanObservation};
 pub use message::{
     MessageKind, PayloadError, RequestId, SignedPayload, VerifiedPayload, topic_for_relationship,
+};
+pub use nat_behavior::{
+    MappingBehavior, MappingSample, NAT_MIN_DISTINCT_DESTINATIONS, NAT_SAMPLE_COHERENCE_MS,
+    NatProfile, aggregate_mapping, classify_mapping,
 };
 pub use ntfy::{NtfyConfig, NtfyHandle, NtfyPacingLoad, NtfyPacingStore, NtfyTransport};
 pub use observation::{

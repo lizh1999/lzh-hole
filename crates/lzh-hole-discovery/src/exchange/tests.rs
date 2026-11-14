@@ -20,6 +20,7 @@ fn verified(kind: MessageKind, request_id: RequestId, outcome: AcceptOutcome) ->
             endpoint: Endpoint::new(Ipv4Addr::new(8, 8, 8, 8), 50_000),
             source: CandidateSource::Stun,
         }],
+        flags: 0,
     };
     VerifiedPayload::for_exchange_test(kind, request_id, outcome, record)
 }

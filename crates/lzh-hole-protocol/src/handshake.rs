@@ -273,6 +273,12 @@ impl Handshake {
         self.responder.len()
     }
 
+    /// The static PUNCH key, for hole-punch frames in either direction.
+    pub fn punch_key(&self) -> Key32 {
+        let roles = Roles::new(self.cfg.me, self.cfg.peer).expect("validated at construction");
+        self.prk.punch_key(roles.lo.as_bytes(), roles.hi.as_bytes())
+    }
+
     /// The static PROBE key, for the responder's keepalive probes.
     pub fn probe_key(&self) -> Key32 {
         let roles = Roles::new(self.cfg.me, self.cfg.peer).expect("validated at construction");
