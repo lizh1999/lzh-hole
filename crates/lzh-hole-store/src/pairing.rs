@@ -36,16 +36,31 @@ pub const LABEL_PAIR_OFFER: &[u8] = b"lzh-hole/v2/pair/offer";
 pub const LABEL_PAIR_ACCEPT: &[u8] = b"lzh-hole/v2/pair/accept";
 /// File name of the identity seed.
 pub const IDENTITY_FILE: &str = "identity.key";
-/// File name of the finalised relationship.
+/// Directory holding one subdirectory per finalised relationship.
+pub const RELATIONSHIPS_DIR: &str = "relationships";
+/// File name of one relationship's finalised record.
 pub const RELATIONSHIP_FILE: &str = "relationship.json";
-/// File name of the relationship PSK.
+/// File name of one relationship's PSK.
 pub const PSK_FILE: &str = "relationship.psk";
-/// File name of the durable sequence high-water mark.
+/// File name of one relationship's durable sequence high-water mark.
 pub const SEQUENCE_FILE: &str = "publish.seq";
+/// File name of one relationship's accepted peer-record high-water cache.
+pub const PEER_RECORD_FILE: &str = "peer-record.json";
 /// File name of the single-writer lock.
 pub const LOCK_FILE: &str = "publish.lock";
-/// File name of the offer the initiator keeps so finalize can verify against it.
-pub const OFFER_FILE: &str = "offer.json";
+/// Directory holding one pending offer per in-flight pairing.
+///
+/// Offers are keyed by pairing id rather than kept in a single file, so a node
+/// can be pairing with a second peer while the first pairing is still waiting
+/// for its acceptance. A single `offer.json` made the second `pair offer`
+/// silently overwrite the first one's PSK.
+pub const OFFERS_DIR: &str = "offers";
+/// Most pending offers one state directory may hold at once.
+///
+/// Bounded so an operator loop cannot turn the state directory into unbounded
+/// growth. It matches the protocol mesh bound, which is the most peers a node
+/// can ever finalise anyway.
+pub const MAX_PENDING_OFFERS: usize = 8;
 /// Largest pairing file we will read.
 pub const MAX_PAIR_FILE_BYTES: u64 = 16 * 1024;
 /// Longest overlay address we accept.
@@ -112,6 +127,60 @@ pub enum PairingError {
     /// No finalised relationship exists.
     #[error("no finalised relationship in {0}; run pair offer/accept/finalize first")]
     NotPaired(PathBuf),
+    /// The requested relationship is not finalised in this state directory.
+    #[error("relationship {0} is not finalised in {1}")]
+    UnknownRelationship(RelationshipId, PathBuf),
+    /// This relationship id is already finalised.
+    #[error("relationship {0} is already finalised in this state directory")]
+    DuplicateRelationship(RelationshipId),
+    /// A pending offer already exists for this pairing id and will not be replaced.
+    #[error(
+        "a pending offer for pairing {0} already exists; refusing to overwrite a PSK a peer may already hold"
+    )]
+    DuplicateOffer(RelationshipId),
+    /// The state directory already holds the maximum number of pending offers.
+    #[error("this state directory already holds the maximum of {0} pending offers")]
+    TooManyPendingOffers(usize),
+    /// Another finalised relationship already pins this peer key.
+    #[error("peer key {peer:?} is already pinned by relationship {existing}")]
+    DuplicatePeerKey {
+        /// The key that would be pinned twice.
+        peer: DiscoveryPublicKey,
+        /// The relationship that already pins it.
+        existing: RelationshipId,
+    },
+    /// Another finalised relationship already uses this overlay address.
+    #[error("overlay address {address} is already used by relationship {existing}")]
+    DuplicateOverlayAddress {
+        /// The address that would be used twice.
+        address: String,
+        /// The relationship that already uses it.
+        existing: RelationshipId,
+    },
+    /// The relationship disagrees with the local identity already established here.
+    #[error(
+        "relationship {relationship} declares local key {actual:?}, but this state directory holds {expected:?}"
+    )]
+    InconsistentIdentity {
+        /// The relationship being finalised.
+        relationship: RelationshipId,
+        /// The local key it declares.
+        actual: DiscoveryPublicKey,
+        /// The local key already established here.
+        expected: DiscoveryPublicKey,
+    },
+    /// The relationship disagrees with the overlay address already established here.
+    #[error(
+        "relationship {relationship} declares local overlay address {actual}, but this state directory holds {expected}"
+    )]
+    InconsistentSelfAddress {
+        /// The relationship being finalised.
+        relationship: RelationshipId,
+        /// The local address it declares.
+        actual: String,
+        /// The local address already established here.
+        expected: String,
+    },
     /// Secret storage refused.
     #[error(transparent)]
     Secret(#[from] SecretError),
@@ -509,9 +578,80 @@ impl StateDir {
         self.file(IDENTITY_FILE).exists()
     }
 
-    /// Whether a relationship is finalised.
+    /// Directory holding one subdirectory per finalised relationship.
+    pub fn relationships_dir(&self) -> PathBuf {
+        self.path.join(RELATIONSHIPS_DIR)
+    }
+
+    /// Directory of one relationship, keyed by its lowercase hex id.
+    pub fn relationship_dir(&self, relationship: RelationshipId) -> PathBuf {
+        self.relationships_dir().join(relationship.to_hex())
+    }
+
+    /// Path of one file inside one relationship's directory.
+    pub fn relationship_file(&self, relationship: RelationshipId, name: &str) -> PathBuf {
+        self.relationship_dir(relationship).join(name)
+    }
+
+    /// Path of one relationship's accepted peer-record high-water cache.
+    pub fn peer_record_path(&self, relationship: RelationshipId) -> PathBuf {
+        self.relationship_file(relationship, PEER_RECORD_FILE)
+    }
+
+    /// Whether this specific relationship is finalised.
+    pub fn is_paired_with(&self, relationship: RelationshipId) -> bool {
+        let dir = self.relationship_dir(relationship);
+        dir.join(RELATIONSHIP_FILE).exists() && dir.join(PSK_FILE).exists()
+    }
+
+    /// Whether at least one relationship is finalised.
     pub fn is_paired(&self) -> bool {
-        self.file(RELATIONSHIP_FILE).exists() && self.file(PSK_FILE).exists()
+        self.relationship_ids().is_ok_and(|ids| !ids.is_empty())
+    }
+
+    /// Every finalised relationship id, sorted.
+    ///
+    /// A directory that does not parse as a relationship id is refused rather
+    /// than skipped: silently ignoring unknown state is how a half-written or
+    /// tampered directory turns into a peer that quietly disappears. Staging
+    /// directories left by an interrupted finalise are the one exception, and
+    /// they are dot-prefixed so they can never be mistaken for a relationship.
+    pub fn relationship_ids(&self) -> Result<Vec<RelationshipId>, PairingError> {
+        let root = self.relationships_dir();
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        crate::secret::verify_private_dir(&root)?;
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&root).map_err(|error| io(&root, error))? {
+            let entry = entry.map_err(|error| io(&root, error))?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| io(&root, "non-UTF-8 relationship directory name"))?;
+            if name.starts_with('.') {
+                continue;
+            }
+            let id = RelationshipId::from_hex(name)
+                .map_err(|error| io(&entry.path(), format!("not a relationship id: {error}")))?;
+            if !entry.path().is_dir() {
+                return Err(io(&entry.path(), "relationship entry is not a directory"));
+            }
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Every finalised relationship, in id order.
+    pub fn load_relationships(&self) -> Result<Vec<Relationship>, PairingError> {
+        let ids = self.relationship_ids()?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.load_relationship(id)?);
+        }
+        Ok(out)
     }
 
     /// Load the Ed25519 seed in its redacted, zeroizing container.
@@ -553,18 +693,32 @@ impl StateDir {
         Ok(())
     }
 
-    /// Load the relationship PSK.
-    pub fn load_psk(&self) -> Result<Secret32, PairingError> {
-        Ok(read_secret_file(&self.file(PSK_FILE))?)
+    /// Load one relationship's PSK.
+    pub fn load_psk(&self, relationship: RelationshipId) -> Result<Secret32, PairingError> {
+        if !self.is_paired_with(relationship) {
+            return Err(PairingError::UnknownRelationship(
+                relationship,
+                self.path.clone(),
+            ));
+        }
+        Ok(read_secret_file(
+            &self.relationship_file(relationship, PSK_FILE),
+        )?)
     }
 
-    /// Load the finalised relationship, with owner, mode, no-follow and length
+    /// Load one finalised relationship, with owner, mode, no-follow and length
     /// checks applied by the reader.
-    pub fn load_relationship(&self) -> Result<Relationship, PairingError> {
-        if !self.is_paired() {
-            return Err(PairingError::NotPaired(self.path.clone()));
+    pub fn load_relationship(
+        &self,
+        relationship: RelationshipId,
+    ) -> Result<Relationship, PairingError> {
+        if !self.is_paired_with(relationship) {
+            return Err(PairingError::UnknownRelationship(
+                relationship,
+                self.path.clone(),
+            ));
         }
-        let path = self.file(RELATIONSHIP_FILE);
+        let path = self.relationship_file(relationship, RELATIONSHIP_FILE);
         let bytes = read_private_bytes(&path, MAX_PAIR_FILE_BYTES)?;
         let text = String::from_utf8(bytes).map_err(|_| io(&path, "not valid UTF-8"))?;
         let rel: Relationship =
@@ -575,22 +729,91 @@ impl StateDir {
         Ok(rel)
     }
 
-    /// Persist the finalised relationship and its PSK.
+    /// Persist one finalised relationship and its PSK.
+    ///
+    /// Everything already finalised is re-read first, and this relationship is
+    /// refused if it would duplicate a relationship id, pin a peer key twice,
+    /// reuse an overlay address, or disagree with the local identity and local
+    /// overlay address this directory already established. A node has exactly
+    /// one identity and one overlay address however many peers it has, and two
+    /// relationships must never share a peer key or an address.
+    ///
+    /// Files are written into a staging directory and renamed into place, so a
+    /// crash can never leave a relationship that has a record but no PSK.
     pub fn finalise(
         &self,
         relationship: &Relationship,
         psk: &Secret32,
     ) -> Result<(), PairingError> {
-        write_secret_file(&self.file(PSK_FILE), psk)?;
+        let id = relationship.relationship_id;
+        if relationship.peer_public_key == relationship.self_public_key {
+            return Err(PairingError::SelfPairing(relationship.peer_public_key));
+        }
+        if relationship.peer_vip == relationship.self_vip {
+            return Err(PairingError::DuplicateOverlayAddress {
+                address: relationship.peer_vip.clone(),
+                existing: id,
+            });
+        }
+        for existing in self.load_relationships()? {
+            if existing.relationship_id == id {
+                return Err(PairingError::DuplicateRelationship(id));
+            }
+            if existing.self_public_key != relationship.self_public_key {
+                return Err(PairingError::InconsistentIdentity {
+                    relationship: id,
+                    actual: relationship.self_public_key,
+                    expected: existing.self_public_key,
+                });
+            }
+            if existing.self_vip != relationship.self_vip {
+                return Err(PairingError::InconsistentSelfAddress {
+                    relationship: id,
+                    actual: relationship.self_vip.clone(),
+                    expected: existing.self_vip.clone(),
+                });
+            }
+            if existing.peer_public_key == relationship.peer_public_key {
+                return Err(PairingError::DuplicatePeerKey {
+                    peer: relationship.peer_public_key,
+                    existing: existing.relationship_id,
+                });
+            }
+            // Only the peer's address has to be new. Our own address is
+            // required to be identical across every relationship, which the
+            // check above already enforced.
+            if existing.self_vip == relationship.peer_vip
+                || existing.peer_vip == relationship.peer_vip
+            {
+                return Err(PairingError::DuplicateOverlayAddress {
+                    address: relationship.peer_vip.clone(),
+                    existing: existing.relationship_id,
+                });
+            }
+        }
+
+        let dir = self.relationship_dir(id);
+        if dir.exists() {
+            return Err(PairingError::DuplicateRelationship(id));
+        }
+        let root = self.relationships_dir();
+        ensure_private_dir(&root)?;
+        let staging = root.join(format!(".{}.staging", id.to_hex()));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging).map_err(|error| io(&staging, error))?;
+        }
+        ensure_private_dir(&staging)?;
+        write_secret_file(&staging.join(PSK_FILE), psk)?;
         let text = serde_json::to_string_pretty(relationship)
             .map_err(|e| PairingError::Format(e.to_string()))?;
-        write_private_bytes(&self.file(RELATIONSHIP_FILE), text.as_bytes())?;
+        write_private_bytes(&staging.join(RELATIONSHIP_FILE), text.as_bytes())?;
+        std::fs::rename(&staging, &dir).map_err(|error| io(&dir, error))?;
         Ok(())
     }
 
-    /// Read the durable sequence high-water mark.
-    pub fn load_sequence(&self) -> Result<u64, PairingError> {
-        let path = self.file(SEQUENCE_FILE);
+    /// Read one relationship's durable sequence high-water mark.
+    pub fn load_sequence(&self, relationship: RelationshipId) -> Result<u64, PairingError> {
+        let path = self.relationship_file(relationship, SEQUENCE_FILE);
         if !path.exists() {
             return Ok(0);
         }
@@ -601,12 +824,25 @@ impl StateDir {
             .map_err(|e| PairingError::Format(format!("publish.seq: {e}")))
     }
 
-    /// Durably record a new sequence high-water mark.
+    /// Durably record a new sequence high-water mark for one relationship.
     ///
     /// Uses a temp file, an atomic rename and a parent directory fsync, so a
-    /// crash can never leave a mark that was never reserved.
-    pub fn store_sequence(&self, seq: u64) -> Result<(), PairingError> {
-        write_private_bytes(&self.file(SEQUENCE_FILE), format!("{seq}\n").as_bytes())?;
+    /// crash can never leave a mark that was never reserved. Each relationship
+    /// owns its own stream: a sequence is only ever compared against that
+    /// peer's own high-water mark, never against another relationship's.
+    pub fn store_sequence(
+        &self,
+        relationship: RelationshipId,
+        seq: u64,
+    ) -> Result<(), PairingError> {
+        if !self.is_paired_with(relationship) {
+            return Err(PairingError::UnknownRelationship(
+                relationship,
+                self.path.clone(),
+            ));
+        }
+        let path = self.relationship_file(relationship, SEQUENCE_FILE);
+        write_private_bytes(&path, format!("{seq}\n").as_bytes())?;
         Ok(())
     }
 
@@ -620,14 +856,99 @@ impl StateDir {
         })
     }
 
-    /// Store the offer so finalize can verify the acceptance against it.
-    pub fn store_offer(&self, offer: &Offer) -> Result<(), PairingError> {
-        write_pair_file(&self.file(OFFER_FILE), offer)
+    /// Directory holding pending offers, one file per pairing id.
+    pub fn offers_dir(&self) -> PathBuf {
+        self.path.join(OFFERS_DIR)
     }
 
-    /// Load the stored offer.
-    pub fn load_offer(&self) -> Result<Offer, PairingError> {
-        read_pair_file(&self.file(OFFER_FILE))
+    /// Path of one pending offer, keyed by its pairing id.
+    pub fn offer_path(&self, pairing: RelationshipId) -> PathBuf {
+        self.offers_dir().join(format!("{}.json", pairing.to_hex()))
+    }
+
+    /// Every pending pairing id, sorted.
+    ///
+    /// A name that is not a pairing id is refused rather than skipped, for the
+    /// same reason `relationship_ids` refuses one: silently ignoring unknown
+    /// state is how a half-written or tampered file turns into a pairing that
+    /// quietly disappears.
+    pub fn pending_offer_ids(&self) -> Result<Vec<RelationshipId>, PairingError> {
+        let root = self.offers_dir();
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        crate::secret::verify_private_dir(&root)?;
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&root).map_err(|error| io(&root, error))? {
+            let entry = entry.map_err(|error| io(&root, error))?;
+            let path = entry.path();
+            if !path.is_file() {
+                return Err(io(&path, "pending offer entry is not a file"));
+            }
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| io(&path, "non-UTF-8 pending offer file name"))?;
+            let stem = name
+                .strip_suffix(".json")
+                .ok_or_else(|| io(&path, "pending offer file name has no .json suffix"))?;
+            ids.push(
+                RelationshipId::from_hex(stem)
+                    .map_err(|error| io(&path, format!("not a pairing id: {error}")))?,
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Store one pending offer so finalize can verify its acceptance against it.
+    ///
+    /// Refuses to overwrite an existing offer for the same pairing id: pairing
+    /// ids are random, so a collision means the caller is about to destroy a
+    /// PSK that some peer may already hold. Refuses a pairing whose relationship
+    /// is already finalised, and refuses to grow the directory past
+    /// [`MAX_PENDING_OFFERS`].
+    pub fn store_offer(&self, offer: &Offer) -> Result<(), PairingError> {
+        offer.verify()?;
+        let pairing = offer.pairing_id;
+        if self.is_paired_with(offer.relationship_id) {
+            return Err(PairingError::DuplicateRelationship(offer.relationship_id));
+        }
+        let path = self.offer_path(pairing);
+        if path.exists() {
+            return Err(PairingError::DuplicateOffer(pairing));
+        }
+        let existing = self.pending_offer_ids()?;
+        if !existing.contains(&pairing) && existing.len() >= MAX_PENDING_OFFERS {
+            return Err(PairingError::TooManyPendingOffers(MAX_PENDING_OFFERS));
+        }
+        ensure_private_dir(&self.offers_dir())?;
+        write_pair_file(&path, offer)
+    }
+
+    /// Load one pending offer and confirm it is the pairing that was asked for.
+    pub fn load_offer(&self, pairing: RelationshipId) -> Result<Offer, PairingError> {
+        let offer: Offer = read_pair_file(&self.offer_path(pairing))?;
+        if offer.pairing_id != pairing {
+            return Err(PairingError::WrongPairing(
+                "stored offer does not carry the requested pairing id",
+            ));
+        }
+        Ok(offer)
+    }
+
+    /// Drop one pending offer once its relationship is finalised.
+    ///
+    /// Removing an offer that is already gone is not an error: finalize may be
+    /// retried after a crash between the rename and this cleanup.
+    pub fn remove_offer(&self, pairing: RelationshipId) -> Result<(), PairingError> {
+        let path = self.offer_path(pairing);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io(&path, error)),
+        }
     }
 }
 

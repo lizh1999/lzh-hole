@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Thin CLI for the direct-only two-host IPv4-over-UDP service"
+description = "Thin CLI for the direct-only multi-host IPv4-over-UDP service"
 
 [[bin]]
 name = "lzh-hole"
@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 lzh-hole-control.workspace = true
+lzh-hole-protocol.workspace = true
 lzh-hole-service.workspace = true
 lzh-hole-store.workspace = true
 lzh-hole-types.workspace = true

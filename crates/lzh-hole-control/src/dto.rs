@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 pub const MAX_DROP_REASONS: usize = 32;
 /// Maximum UTF-8 byte length of one drop-reason key.
 pub const MAX_DROP_REASON_BYTES: usize = 64;
+/// Maximum peers one snapshot may carry, matching the protocol mesh bound.
+pub const MAX_PEERS_IN_SNAPSHOT: usize = 8;
+/// Maximum candidate hints retained per peer in one snapshot.
+pub const MAX_CANDIDATES_PER_PEER: usize = 32;
 
 /// Health of one measured subsystem. `Unknown` never means healthy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +219,37 @@ pub struct PunchStatus {
     pub started_unix_ms: Option<u64>,
 }
 
+/// One pinned peer's actual observations. Every field is an observation,
+/// never a promise of reachability.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerStatus {
+    /// Lowercase hex relationship id, exactly 32 characters.
+    pub relationship_id: String,
+    /// This peer's overlay /32 virtual IPv4 address.
+    pub peer_vip: String,
+    /// This peer's pinned discovery public key.
+    pub peer_key: String,
+    /// Pairing role of this node in this relationship: `initiator` or `responder`.
+    pub role: String,
+    /// Latest authenticated session observation for this peer.
+    pub session: ComponentStatus,
+    /// End-to-end direct-path evidence for this peer.
+    pub overlay: OverlayHealth,
+    /// Latest ntfy coordination observation for this relationship.
+    pub ntfy: ComponentStatus,
+    /// This peer's currently selected path, if any.
+    pub current_path: Option<CurrentPathStatus>,
+    /// This peer's eligible transport-bound candidates, never online evidence.
+    pub candidates: Vec<CandidateStatus>,
+    /// This peer's hole-punch state.
+    pub punch: PunchStatus,
+    /// Dataplane byte counters attributed to this peer.
+    pub bytes: ByteCounters,
+    /// Dataplane drop counters attributed to this peer.
+    pub drops: DropCounters,
+}
+
 /// Fresh doctor data returned to the local management client.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -227,7 +262,8 @@ pub struct ServiceSnapshot {
     pub lan: ComponentStatus,
     /// Latest STUN observation on the physical data socket.
     pub stun: ComponentStatus,
-    /// Latest authenticated peer session observation.
+    /// Cross-peer aggregate of `peers[].session`; see [`ServiceSnapshot::set_peers`].
+    /// Never more optimistic than the worst peer.
     pub session: ComponentStatus,
     /// Latest actual utun state; default is Unknown, not created.
     pub tun: ComponentStatus,
@@ -237,18 +273,87 @@ pub struct ServiceSnapshot {
     pub bytes: ByteCounters,
     /// Dataplane drop counters and bounded reasons.
     pub drops: DropCounters,
-    /// End-to-end direct-path evidence, independent of daemon Running.
+    /// Cross-peer aggregate of `peers[].overlay`; see [`ServiceSnapshot::set_peers`].
+    /// `Some(true)` only when every peer measured `Some(true)`.
     pub overlay: OverlayHealth,
     /// Hole-punch state; default is an idle, unclassified snapshot.
     pub punch: PunchStatus,
-    /// Current selected path, including its real physical socket.
+    /// Always `None`: a selected path belongs to exactly one peer, so a
+    /// node-level path would be ambiguous. See `peers[].current_path`.
     pub current_path: Option<CurrentPathStatus>,
-    /// At most 32 eligible transport-bound candidates, not online evidence.
+    /// Always empty: candidates belong to one peer each and are only reported
+    /// in `peers[].candidates`, capped at [`MAX_CANDIDATES_PER_PEER`] per peer.
     pub candidates: Vec<CandidateStatus>,
+    /// Per-peer observations, at most MAX_PEERS_IN_SNAPSHOT entries.
+    pub peers: Vec<PeerStatus>,
     /// Truthful backend update accounting.
     pub discovery: DiscoveryCounters,
     /// Timestamp of the latest snapshot update, zero if not supplied.
     pub updated_unix_ms: u64,
+}
+
+/// Worst-case severity rank of a component state; a higher rank is worse.
+///
+/// `Failed` > `Degraded` > `Starting` > `Unknown` > `Stopped` > `NotConfigured` > `Healthy`.
+///
+/// `Unknown` deliberately outranks `Stopped`, `NotConfigured` and `Healthy`:
+/// an unmeasured peer must never let an aggregate claim health, because
+/// "not measured" is not evidence of anything. It stays below `Starting`,
+/// `Degraded` and `Failed`, which are actual observations of an ongoing or
+/// failed operation and therefore strictly more informative.
+const fn state_severity(state: ComponentState) -> u8 {
+    match state {
+        ComponentState::Failed => 6,
+        ComponentState::Degraded => 5,
+        ComponentState::Starting => 4,
+        ComponentState::Unknown => 3,
+        ComponentState::Stopped => 2,
+        ComponentState::NotConfigured => 1,
+        ComponentState::Healthy => 0,
+    }
+}
+
+/// Stable lowercase label for one component state, matching its wire form.
+const fn state_label(state: ComponentState) -> &'static str {
+    match state {
+        ComponentState::Unknown => "unknown",
+        ComponentState::Starting => "starting",
+        ComponentState::Healthy => "healthy",
+        ComponentState::Degraded => "degraded",
+        ComponentState::Failed => "failed",
+        ComponentState::Stopped => "stopped",
+        ComponentState::NotConfigured => "not_configured",
+    }
+}
+
+/// Aggregate one three-state measurement across peers, never upgrading it.
+///
+/// * any `Some(false)` wins and yields `Some(false)`;
+/// * otherwise a single unmeasured (`None`) peer makes the aggregate `None`,
+///   because unmeasured is not healthy;
+/// * `Some(true)` only when every peer measured `Some(true)`;
+/// * no peers at all yields `None`.
+fn aggregate_measured(values: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    let mut seen = false;
+    let mut unmeasured = false;
+    for value in values {
+        seen = true;
+        match value {
+            Some(false) => return Some(false),
+            Some(true) => {}
+            None => unmeasured = true,
+        }
+    }
+    if !seen || unmeasured {
+        None
+    } else {
+        Some(true)
+    }
+}
+
+/// Maximum of the supplied optional timestamps, or `None` when all are `None`.
+fn max_timestamp(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    values.into_iter().flatten().max()
 }
 
 impl ServiceSnapshot {
@@ -270,6 +375,105 @@ impl ServiceSnapshot {
     pub fn mark_daemon_running(&mut self, observed_unix_ms: u64) {
         self.daemon.state = DaemonState::Running;
         self.updated_unix_ms = observed_unix_ms;
+    }
+
+    /// Replace the per-peer list and recompute the node-level aggregate fields.
+    ///
+    /// Refuses (returns false and leaves the snapshot completely unchanged)
+    /// when the list is empty or longer than MAX_PEERS_IN_SNAPSHOT. Each peer's
+    /// candidate list is truncated to MAX_CANDIDATES_PER_PEER.
+    ///
+    /// This is the single place where aggregation rules live; the service owner
+    /// supplies per-peer observations and must not re-implement them. The call
+    /// is all-or-nothing: every aggregate below is computed first and only then
+    /// committed, so a rejected call leaves `peers` and all aggregates exactly
+    /// as they were.
+    ///
+    /// Aggregation rules:
+    ///
+    /// * `overlay.direct_reachable` and `overlay.currently_healthy` are the
+    ///   three-state AND of the per-peer values: `Some(true)` only when *every*
+    ///   peer measured `Some(true)`, `Some(false)` as soon as one peer measured
+    ///   `Some(false)`, and `None` when no peer is negative but at least one is
+    ///   unmeasured. Unmeasured never becomes healthy. An empty peer list is
+    ///   refused, so aggregates are never derived from "no peers".
+    /// * `session.state` is the worst per-peer state, with severity
+    ///   `Failed` > `Degraded` > `Starting` > `Unknown` > `Stopped` >
+    ///   `NotConfigured` > `Healthy` (see [`state_severity`]). `Unknown`
+    ///   outranks `Healthy` so an unmeasured peer cannot be laundered into a
+    ///   healthy node-level claim.
+    /// * `session.detail` and `overlay.detail` are regenerated and always state
+    ///   the peer count, the healthy/measured counts, and that the selected
+    ///   path is per-peer (`peers[].current_path`). Per-peer reasons stay in
+    ///   `peers[]`; the aggregate never invents a node-level cause.
+    /// * `session.last_success_unix_ms` and `session.last_change_unix_ms` are
+    ///   the maximum of the per-peer values, and `None` when every peer is
+    ///   `None`.
+    /// * `current_path` is always set to `None` and `candidates` is always
+    ///   emptied: a path and a candidate belong to exactly one peer, so a
+    ///   node-level value would be ambiguous rather than informative.
+    ///
+    /// All other node-level fields (`daemon`, `ntfy`, `lan`, `stun`, `tun`,
+    /// `routes`, `bytes`, `drops`, `punch`, `discovery`, `updated_unix_ms`) are
+    /// left untouched; their per-peer counterparts live in `peers[]`.
+    pub fn set_peers(&mut self, mut peers: Vec<PeerStatus>) -> bool {
+        if peers.is_empty() || peers.len() > MAX_PEERS_IN_SNAPSHOT {
+            return false;
+        }
+        for peer in &mut peers {
+            peer.candidates.truncate(MAX_CANDIDATES_PER_PEER);
+        }
+
+        let total = peers.len();
+        let worst_state = peers
+            .iter()
+            .map(|peer| peer.session.state)
+            .max_by_key(|state| state_severity(*state))
+            .unwrap_or(ComponentState::Unknown);
+        let healthy_peers = peers
+            .iter()
+            .filter(|peer| peer.session.state == ComponentState::Healthy)
+            .count();
+        let last_success_unix_ms =
+            max_timestamp(peers.iter().map(|peer| peer.session.last_success_unix_ms));
+        let last_change_unix_ms =
+            max_timestamp(peers.iter().map(|peer| peer.session.last_change_unix_ms));
+        let direct_reachable =
+            aggregate_measured(peers.iter().map(|peer| peer.overlay.direct_reachable));
+        let currently_healthy =
+            aggregate_measured(peers.iter().map(|peer| peer.overlay.currently_healthy));
+        let reachable_peers = peers
+            .iter()
+            .filter(|peer| peer.overlay.direct_reachable == Some(true))
+            .count();
+        let healthy_path_peers = peers
+            .iter()
+            .filter(|peer| peer.overlay.currently_healthy == Some(true))
+            .count();
+
+        let session = ComponentStatus {
+            state: worst_state,
+            detail: Some(format!(
+                "aggregate of {total} peers: worst session state {}, {healthy_peers}/{total} healthy; per-peer detail in peers[]",
+                state_label(worst_state),
+            )),
+            last_success_unix_ms,
+            last_change_unix_ms,
+        };
+        let overlay = OverlayHealth {
+            direct_reachable,
+            currently_healthy,
+            detail: Some(format!(
+                "aggregate of {total} peers: {reachable_peers}/{total} direct_reachable, {healthy_path_peers}/{total} currently_healthy; current_path is per-peer, see peers[].current_path",
+            )),
+        };
+
+        self.session = session;
+        self.overlay = overlay;
+        self.current_path = None;
+        self.candidates.clear();
+        self.peers = peers;
+        true
     }
 }
 
@@ -342,3 +546,6 @@ pub enum ControlResponse {
         message: String,
     },
 }
+
+#[cfg(test)]
+mod tests;

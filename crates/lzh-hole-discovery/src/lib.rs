@@ -10,8 +10,10 @@ pub mod lan;
 pub mod message;
 pub mod nat_behavior;
 pub mod ntfy;
+pub mod ntfy_dns;
 pub mod observation;
 pub mod pacing;
+pub mod peer_public;
 pub mod peer_record;
 pub mod public;
 pub mod record;
@@ -19,7 +21,7 @@ pub mod stun;
 pub mod transport;
 
 pub use exchange::{Delivery, ExchangeAction, ExchangeError, ExchangeTracker};
-pub use lan::{LanAdvertisement, LanDiscovery, LanObservation};
+pub use lan::{LanAdvertisement, LanDiscovery, LanObservation, LanUpdate};
 pub use message::{
     MessageKind, PayloadError, RequestId, SignedPayload, VerifiedPayload, topic_for_relationship,
 };
@@ -28,14 +30,18 @@ pub use nat_behavior::{
     NatProfile, aggregate_mapping, classify_mapping,
 };
 pub use ntfy::{NtfyConfig, NtfyHandle, NtfyPacingLoad, NtfyPacingStore, NtfyTransport};
+pub use ntfy_dns::{GatewayDnsConfig, GatewayDnsResolver, QueryPlan, ResolveError};
 pub use observation::{
     CandidateHint, CandidateScope, DiscoveryOrigin, DiscoveryUpdate, HintSource, LanScope,
     ObservationId,
 };
+pub use peer_public::{PeerPublic, PendingPublicRequest, PublicAcceptError, PublicExpiry};
 pub use peer_record::{PeerRecordPolicy, PeerRecordReject, ValidatedPeerRecord};
-pub use public::PublicDiscovery;
+pub use public::{PublicDiscovery, PublicTransportId};
 pub use record::{
     AcceptOutcome, ContactRecord, MAX_LIFETIME_MS, PeerRecordState, RecordCandidate, RecordError,
     reserve_sequence,
 };
-pub use transport::{NtfyError, NtfyEvent, NtfyOperation, TryPublishError};
+pub use transport::{
+    MAX_NTFY_TOPICS, NtfyError, NtfyEvent, NtfyOperation, NtfyResolver, TryPublishError,
+};

@@ -1050,6 +1050,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "lzh-hole-control",
+ "lzh-hole-protocol",
  "lzh-hole-service",
  "lzh-hole-store",
  "lzh-hole-types",
@@ -1083,6 +1084,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "httpdate",
+ "lzh-hole-net",
  "lzh-hole-protocol",
  "lzh-hole-store",
  "lzh-hole-types",

@@ -1,3 +1,20 @@
+//! Node-level discovery I/O and per-relationship coordination handling.
+//!
+//! STUN, Bonjour browsing and Bonjour registration are node-level: they measure
+//! and advertise this host, not any peer. Everything derived from a peer's
+//! authenticated material is per relationship and is handed to exactly one
+//! `PeerRuntime`:
+//!
+//! - a payload is verified against the relationship carried by the ntfy event
+//!   it arrived on, never against a relationship guessed from its contents;
+//! - a Bonjour observation is attributed by the pinned peer key in its TXT
+//!   record, which is what makes "peer A's address is a candidate for A's
+//!   engine only" true rather than aspirational;
+//! - a durable sequence is reserved from that relationship's own stream.
+
+use lzh_hole_discovery::{Delivery, ExchangeAction, MessageKind, PublicTransportId};
+
+use super::peer::NodeFacts;
 use super::status::component;
 use super::*;
 
@@ -54,33 +71,27 @@ pub(super) fn publication_endpoints(
 }
 
 impl Daemon {
-    /// Coordination flags published with the next contact record.
+    /// Ask every relationship whether its advertised view went stale.
     ///
-    /// The mapping verdict is this host's own measurement, reduced across every
-    /// retained socket by taking the hardest one. The punch offer bit is only
-    /// set while a punch window is actually open, so a peer never scans an
-    /// address that has no sockets behind it.
-    pub(super) fn record_flags(&self) -> u8 {
-        let mapping = lzh_hole_discovery::aggregate_mapping(
-            self.public
-                .mapping_behaviors()
-                .into_iter()
-                .map(|(_, profile)| profile.mapping),
-        );
-        let mut flags = mapping.record_flags();
-        if self.punch_offer_active() {
-            flags |= lzh_hole_discovery::record::FLAG_PUNCH_OFFER;
-        }
-        flags
-    }
-
-    pub(super) fn refresh_public_request(&mut self) {
-        let flags = self.record_flags();
-        if let Some(id) = self
+    /// The node's own public mappings are shared, so one NAT rebinding makes
+    /// every relationship due exactly once; the per-relationship memory of what
+    /// it last advertised is what keeps an idle timer tick from re-publishing.
+    pub(super) fn refresh_public_requests(&mut self) {
+        let now = self.monotonic_ms();
+        let mappings = self
             .public
-            .request_refresh_needed(self.monotonic_ms(), flags)
-        {
-            self.exchange.cancel_request(id);
+            .own_mappings(now)
+            .into_iter()
+            .map(|mapping| (mapping.transport as PublicTransportId, mapping.endpoint))
+            .collect::<Vec<_>>();
+        for id in self.peer_order.clone() {
+            let flags = self.record_flags_for(id);
+            let Some(peer) = self.peers.get_mut(&id) else {
+                continue;
+            };
+            if let Some(request) = peer.public.request_refresh_needed(now, &mappings, flags) {
+                peer.exchange.cancel_request(request);
+            }
         }
     }
 
@@ -89,11 +100,16 @@ impl Daemon {
         self.mdns_operations.clear();
         let scopes = std::mem::take(&mut self.lan_scopes);
         let transports = self.candidate_transports();
+        let mut updates = Vec::new();
         for scope in scopes.into_values() {
-            for update in self.lan.revoke_interface(scope) {
-                self.registry.apply(update, &transports);
-            }
+            updates.extend(
+                self.lan
+                    .revoke_interface(scope)
+                    .into_iter()
+                    .map(|update| (update.relationship_id, update.update)),
+            );
         }
+        self.apply_tagged_updates_with(updates, &transports);
         self.next_mdns_retry = Instant::now();
     }
 
@@ -111,6 +127,7 @@ impl Daemon {
         if Instant::now() < self.next_mdns_retry {
             return;
         }
+        let self_key = self.self_key();
         let client = self.mdns.get_or_insert_with(MdnsClient::new);
         let mut error = None;
         for scope in self.lan_scopes.values() {
@@ -133,17 +150,13 @@ impl Daemon {
             ) {
                 continue;
             }
-            let Ok(advertisement) = LanAdvertisement::new(
-                self.resolved.relationship.self_public_key,
-                endpoint(socket.local),
-            ) else {
+            // One advertisement per bound socket, always naming this node's own
+            // key. Which relationship an observer attributes it to is decided by
+            // the observer's own pinned set, never by anything we transmit.
+            let Ok(advertisement) = LanAdvertisement::new(self_key, endpoint(socket.local)) else {
                 continue;
             };
-            let instance = format!(
-                "lzh-{}-{}",
-                &self.resolved.relationship.self_public_key.to_string()[..12],
-                socket.id.0
-            );
+            let instance = format!("lzh-{}-{}", &self_key.to_string()[..12], socket.id.0);
             match client.register(
                 socket.interface_index,
                 &instance,
@@ -250,16 +263,24 @@ impl Daemon {
                     txt: record.txt,
                     ttl_ms,
                 };
+                // The relationship comes from the pinned key in the
+                // advertisement's TXT record, resolved inside LanDiscovery. An
+                // advertisement from a key we do not pin is refused there.
                 let updates = match self.lan.observe(observation, self.monotonic_ms()) {
-                    Ok(updates) => updates,
+                    Ok(updates) => updates
+                        .into_iter()
+                        .map(|update| (update.relationship_id, update.update))
+                        .collect::<Vec<_>>(),
                     Err(_) => {
                         self.record_drop("invalid_lan_observation", 1);
-                        self.lan.remove(&instance, scope)
+                        self.lan
+                            .remove(&instance, scope)
+                            .into_iter()
+                            .map(|update| (update.relationship_id, update.update))
+                            .collect::<Vec<_>>()
                     }
                 };
-                if !updates.is_empty() {
-                    self.apply_discovery_updates(updates);
-                }
+                self.apply_tagged_updates(updates);
             }
             MdnsEvent::Remove { operation, key } => {
                 let Some(MdnsOperation::Browse(scope)) =
@@ -268,19 +289,25 @@ impl Daemon {
                     return;
                 };
                 if self.lan_scopes.get(&key.interface_index) == Some(&scope) {
-                    let updates = self.lan.remove(&key.name, scope);
-                    if !updates.is_empty() {
-                        self.apply_discovery_updates(updates);
-                    }
+                    let updates = self
+                        .lan
+                        .remove(&key.name, scope)
+                        .into_iter()
+                        .map(|update| (update.relationship_id, update.update))
+                        .collect::<Vec<_>>();
+                    self.apply_tagged_updates(updates);
                 }
             }
             MdnsEvent::Error { operation, code } => {
                 if let Some(MdnsOperation::Browse(scope)) = self.mdns_operations.remove(&operation)
                 {
-                    let updates = self.lan.revoke_interface(scope);
-                    if !updates.is_empty() {
-                        self.apply_discovery_updates(updates);
-                    }
+                    let updates = self
+                        .lan
+                        .revoke_interface(scope)
+                        .into_iter()
+                        .map(|update| (update.relationship_id, update.update))
+                        .collect::<Vec<_>>();
+                    self.apply_tagged_updates(updates);
                 }
                 self.lan_status = component(
                     ComponentState::Degraded,
@@ -356,22 +383,44 @@ impl Daemon {
                     ),
                     Some(now_unix_ms()),
                 );
-                self.refresh_public_request();
+                self.refresh_public_requests();
             }
             Ok(None) => self.record_drop("unexpected_stun", 1),
             Err(_) => self.record_drop("bad_stun_response", 1),
         }
     }
 
+    /// The single ntfy actor stopped. Every relationship loses coordination;
+    /// none of them loses its UDP data path or its persisted pacing budget.
+    pub(super) fn handle_ntfy_closed(&mut self) {
+        self.ntfy_events = None;
+        for peer in self.peers.values_mut() {
+            peer.ntfy.subscribed = false;
+            peer.ntfy.status = component(
+                ComponentState::Failed,
+                "ntfy actor stopped; UDP continues and the operation budget is not reset",
+                peer.ntfy.status.last_success_unix_ms,
+            );
+        }
+    }
+
     pub(super) async fn handle_ntfy(&mut self, event: NtfyEvent) {
         match event {
-            NtfyEvent::Subscribed { cached_replay } => {
-                self.ntfy_subscribed = true;
-                self.ntfy_block = None;
-                self.ntfy_status = ComponentStatus {
+            NtfyEvent::Subscribed {
+                relationship,
+                cached_replay,
+            } => {
+                let Some(peer) = self.peers.get_mut(&relationship) else {
+                    self.record_drop("unknown_relationship_event", 1);
+                    return;
+                };
+                peer.ntfy.subscribed = true;
+                peer.ntfy.clear_block();
+                peer.ntfy.status = ComponentStatus {
                     state: ComponentState::Healthy,
                     detail: Some(format!(
-                        "NDJSON subscribed (cached_replay={cached_replay}); this is not peer presence; requests remain paced and retain their signed expiry"
+                        "NDJSON subscribed (cached_replay={cached_replay}); this is not peer \
+                         presence; requests remain paced and retain their signed expiry"
                     )),
                     last_success_unix_ms: Some(now_unix_ms()),
                     last_change_unix_ms: Some(now_unix_ms()),
@@ -379,187 +428,204 @@ impl Daemon {
                 // A reconnect does not invalidate an already published request.
                 // Keep its correlation and original signed expiry instead of
                 // burning another public operation and durable sequence.
-                self.maybe_queue_request();
+                self.maybe_queue_request_for(relationship);
             }
             NtfyEvent::Received {
+                relationship,
                 payload,
                 delivery,
                 ntfy_id,
             } => {
-                self.handle_signed_payload(payload, delivery, &ntfy_id)
+                self.handle_signed_payload(relationship, payload, delivery, &ntfy_id)
                     .await
             }
-            NtfyEvent::Published { kind, request_id } => {
-                self.ntfy_block = None;
+            NtfyEvent::Published {
+                relationship,
+                kind,
+                request_id,
+            } => {
+                let Some(peer) = self.peers.get_mut(&relationship) else {
+                    self.record_drop("unknown_relationship_event", 1);
+                    return;
+                };
+                peer.ntfy.clear_block();
                 let now = now_unix_ms();
-                if self.ntfy_subscribed {
-                    self.ntfy_status.state = ComponentState::Healthy;
-                    self.ntfy_status.last_success_unix_ms = Some(now);
-                    self.ntfy_status.last_change_unix_ms = Some(now);
+                if peer.ntfy.subscribed {
+                    peer.ntfy.status.state = ComponentState::Healthy;
+                    peer.ntfy.status.last_success_unix_ms = Some(now);
+                    peer.ntfy.status.last_change_unix_ms = Some(now);
                 }
-                self.ntfy_status.detail = Some(format!(
+                peer.ntfy.status.detail = Some(format!(
                     "ntfy HTTP 200 for {kind:?}/{request_id}; not peer receipt, presence or UDP health"
                 ));
             }
             NtfyEvent::PublishFailed {
+                relationship,
                 kind,
                 request_id,
                 detail,
             } => {
+                // Read the clock before taking the peer borrow: the peer is
+                // borrowed mutably for the rest of this arm.
+                let now = self.monotonic_ms();
+                let Some(peer) = self.peers.get_mut(&relationship) else {
+                    self.record_drop("unknown_relationship_event", 1);
+                    return;
+                };
                 if kind == MessageKind::Request
-                    && self
+                    && peer
                         .public
                         .pending_request()
                         .is_some_and(|pending| pending.id == request_id)
                 {
-                    self.exchange.cancel_request(request_id);
-                    self.public.request_failed(request_id, self.monotonic_ms());
+                    peer.exchange.cancel_request(request_id);
+                    peer.public.request_failed(request_id, now);
                 }
-                self.ntfy_status = self.degraded_ntfy(format!(
+                let status = peer.ntfy.degraded(format!(
                     "signed payload discarded without POST success: {detail}"
                 ));
+                peer.ntfy.status = status;
             }
             NtfyEvent::Error {
+                relationship,
                 operation,
                 detail,
                 retry_after,
             } => {
                 let latest = format!("ntfy {operation}: {detail}; UDP state is independent");
-                if let Some(delay) = retry_after.filter(|delay| !delay.is_zero()) {
-                    let now = now_unix_ms();
-                    let delay_ms = delay.as_millis().min(u64::MAX as u128) as u64;
-                    let proposed = now.saturating_add(delay_ms);
-                    let previous = self
-                        .ntfy_block
-                        .as_ref()
-                        .filter(|block| block.not_before_unix_ms > now);
-                    let not_before_unix_ms = previous
-                        .map(|block| block.not_before_unix_ms.max(proposed))
-                        .unwrap_or(proposed);
-                    let detail = previous
-                        .map(|block| block.detail.clone())
-                        .unwrap_or(latest.clone());
-                    self.ntfy_block = Some(NtfyBlock {
-                        detail,
-                        not_before_unix_ms,
-                    });
-                }
-                self.ntfy_status = self.degraded_ntfy(latest);
-                if operation == NtfyOperation::Subscribe {
-                    self.ntfy_subscribed = false;
+                // A host-level failure is reported against every relationship;
+                // an attributed one only against its own, so one relationship's
+                // stream failure never marks another relationship degraded.
+                let targets = match relationship {
+                    Some(id) if self.peers.contains_key(&id) => vec![id],
+                    Some(_) => {
+                        self.record_drop("unknown_relationship_event", 1);
+                        return;
+                    }
+                    None => self.peer_order.clone(),
+                };
+                for id in targets {
+                    let Some(peer) = self.peers.get_mut(&id) else {
+                        continue;
+                    };
+                    if let Some(delay) = retry_after {
+                        peer.ntfy.note_retry_after(latest.clone(), delay);
+                    }
+                    let status = peer.ntfy.degraded(latest.clone());
+                    peer.ntfy.status = status;
+                    if operation == NtfyOperation::Subscribe {
+                        peer.ntfy.subscribed = false;
+                    }
                 }
             }
         }
     }
 
-    fn degraded_ntfy(&self, latest: String) -> ComponentStatus {
-        let now = now_unix_ms();
-        if let Some(block) = self
-            .ntfy_block
-            .as_ref()
-            .filter(|block| block.not_before_unix_ms > now)
-        {
-            let latest = if latest == block.detail {
-                String::new()
-            } else {
-                format!("; latest: {latest}")
-            };
-            return component(
-                ComponentState::Degraded,
-                format!(
-                    "{}{latest}; ntfy operations blocked until unix ms {}",
-                    block.detail, block.not_before_unix_ms
-                ),
-                self.ntfy_status.last_success_unix_ms,
-            );
-        }
-        component(
-            ComponentState::Degraded,
-            latest,
-            self.ntfy_status.last_success_unix_ms,
-        )
-    }
-
-    pub(super) fn ntfy_waiting(&self) -> bool {
-        self.ntfy_block
-            .as_ref()
-            .is_some_and(|block| block.not_before_unix_ms > now_unix_ms())
-    }
-
-    fn write_ntfy_detail(&mut self, detail: String) {
-        if self.ntfy_waiting() {
-            self.ntfy_status = self.degraded_ntfy(detail);
-        } else {
-            self.ntfy_status.detail = Some(detail);
-        }
-    }
-
+    /// Verify one payload against exactly one relationship and use its candidates.
     pub(super) async fn handle_signed_payload(
         &mut self,
+        relationship: RelationshipId,
         payload: SignedPayload,
         delivery: Delivery,
         ntfy_id: &str,
     ) {
-        let now = now_unix_ms();
-        let mut policy = PeerRecordPolicy::new(
-            self.resolved.relationship.relationship_id,
-            self.resolved.relationship.self_public_key,
-            self.resolved.relationship.peer_public_key,
-            now,
-        );
-        policy.stun_servers = self
-            .resolved
-            .config
-            .stun_seeds
-            .iter()
-            .map(|address| endpoint(*address))
-            .collect();
-        policy.own_endpoints = self.own_endpoints(self.monotonic_ms());
-        policy.forbidden_addresses = vec![self.resolved.self_vip, self.resolved.peer_vip];
-        let verified = match payload.verify(&policy, self.peer_cache.state()) {
-            Ok(verified) => verified,
-            Err(error) => {
-                self.record_drop("invalid_peer_record", 1);
-                self.write_ntfy_detail(format!(
-                    "signed payload rejected; not used as a candidate: {error}"
-                ));
-                return;
-            }
-        };
+        if !self.peers.contains_key(&relationship) {
+            self.record_drop("unknown_relationship", 1);
+            return;
+        }
         let monotonic = self.monotonic_ms();
-        let updates = match self
-            .public
-            .accept_verified(&verified, now, monotonic, |state| {
-                self.peer_cache.commit(state)
-            }) {
-            Ok(updates) => updates,
-            Err(error) => {
-                self.record_drop("peer_highwater_write_failed", 1);
-                self.write_ntfy_detail(format!("signed payload not used: {error:?}"));
+        let (stun_servers, forbidden_addresses) = self.node_fact_parts();
+        let self_key = self.self_key();
+        let boot_id = self.boot_id;
+        let generation = self.generation;
+        let flags = self.record_flags_for(relationship);
+        let punch_offer_deadline = self.punch_offer_deadline_for(relationship);
+
+        let facts = NodeFacts {
+            ntfy_handle: self.ntfy_handle.as_ref(),
+            engines: self.engines.as_ref(),
+            state: &self.state,
+            signing_key: &self.signing_key,
+            public: &self.public,
+            transports: &self.transports,
+            boot_id,
+            generation,
+            self_key,
+            stun_servers,
+            forbidden_addresses,
+            monotonic_ms: monotonic,
+            flags,
+            punch_offer_deadline,
+        };
+        let Some(peer) = self.peers.get_mut(&relationship) else {
+            return;
+        };
+        let (updates, verified) = match facts.accept_payload(peer, &payload) {
+            Ok(value) => value,
+            Err(detail) => {
+                peer.record_drop("invalid_peer_record", 1);
+                peer.ntfy.write_detail(detail);
                 return;
             }
         };
-        // Remember the peer's coordination flags. They are advisory only:
-        // the punch coordinator refuses to act on an unclassified peer.
-        self.peer_record_flags = verified.validated.record.flags;
-        self.peer_record_expires_ms = verified.validated.record.expires_at_unix_ms;
-        self.write_ntfy_detail(format!(
+        peer.ntfy.write_detail(format!(
             "verified ntfy message {ntfy_id} as {delivery:?}; candidates only, not online evidence"
         ));
-        self.apply_discovery_updates(updates);
-        match self.exchange.on_verified(&verified, delivery) {
+        let action = facts.apply_exchange(peer, &verified, delivery);
+
+        let tagged = updates
+            .into_iter()
+            .map(|update| (relationship, update))
+            .collect::<Vec<_>>();
+        self.apply_tagged_updates(tagged);
+
+        match action {
             ExchangeAction::ReplyOnce(request_id) => {
-                if self.ntfy_waiting() {
-                    self.ntfy_status = self.degraded_ntfy(
-                        "live request verified, but its reply is deferred until the persisted ntfy retry boundary; peer must use a fresh request"
+                let Some(peer) = self.peers.get_mut(&relationship) else {
+                    return;
+                };
+                if peer.ntfy.waiting() {
+                    let status = peer.ntfy.degraded(
+                        "live request verified, but its reply is deferred until the persisted ntfy                          retry boundary; peer must use a fresh request"
                             .to_owned(),
                     );
-                } else if let Err(error) = self.queue_payload(MessageKind::Reply, request_id) {
-                    self.write_ntfy_detail(error);
+                    peer.ntfy.status = status;
+                    return;
+                }
+                let facts = NodeFacts {
+                    ntfy_handle: self.ntfy_handle.as_ref(),
+                    engines: self.engines.as_ref(),
+                    state: &self.state,
+                    signing_key: &self.signing_key,
+                    public: &self.public,
+                    transports: &self.transports,
+                    boot_id,
+                    generation,
+                    self_key,
+                    stun_servers: self
+                        .resolved
+                        .config
+                        .stun_seeds
+                        .iter()
+                        .map(|server| endpoint(*server))
+                        .collect(),
+                    forbidden_addresses: self.forbidden_addresses(),
+                    monotonic_ms: self.monotonic_ms(),
+                    flags: self.record_flags_for(relationship),
+                    punch_offer_deadline: self.punch_offer_deadline_for(relationship),
+                };
+                let Some(peer) = self.peers.get_mut(&relationship) else {
+                    return;
+                };
+                if let Err(error) = facts.queue_payload(peer, MessageKind::Reply, request_id) {
+                    peer.ntfy.write_detail(error);
                 }
             }
             ExchangeAction::ReplyMatched(request_id) => {
-                self.public.request_matched(request_id, self.monotonic_ms());
+                let monotonic = self.monotonic_ms();
+                if let Some(peer) = self.peers.get_mut(&relationship) {
+                    peer.public.request_matched(request_id, monotonic);
+                }
             }
             ExchangeAction::Cached
             | ExchangeAction::DuplicateRequest
@@ -567,111 +633,111 @@ impl Daemon {
         }
     }
 
-    pub(super) fn own_endpoints(&self, now_ms: u64) -> Vec<Endpoint> {
-        let mut endpoints = self
-            .public
-            .own_mappings(now_ms)
-            .into_iter()
-            .map(|mapping| mapping.endpoint)
-            .collect::<Vec<_>>();
-        endpoints.extend(self.transports.iter().map(|socket| endpoint(socket.local)));
-        endpoints.sort();
-        endpoints.dedup();
-        endpoints
-    }
-
-    pub(super) fn maybe_queue_request(&mut self) {
-        if !self.network_enabled
-            || !self.ntfy_subscribed
-            || self.ntfy_waiting()
-            || !self.public.request_due(self.monotonic_ms())
-            || self.public.own_mappings(self.monotonic_ms()).is_empty()
-            || self
-                .engine
-                .as_ref()
-                .is_some_and(|engine| engine.snapshot(now_unix_ms()).currently_healthy)
-        {
+    /// Consider every relationship for a fresh coordination request.
+    pub(super) fn maybe_queue_requests(&mut self) {
+        if !self.network_enabled {
             return;
         }
-        let id = match RequestId::random() {
-            Ok(id) => id,
+        for id in self.peer_order.clone() {
+            self.maybe_queue_request_for(id);
+        }
+    }
+
+    /// Queue one relationship's request if it is actually due.
+    ///
+    /// Skipped while this peer's own engine is healthy: coordination exists to
+    /// find a path, not to keep one alive.
+    pub(super) fn maybe_queue_request_for(&mut self, relationship: RelationshipId) {
+        if !self.network_enabled {
+            return;
+        }
+        let monotonic = self.monotonic_ms();
+        let now = now_unix_ms();
+        if self.public.own_mappings(monotonic).is_empty() {
+            return;
+        }
+        let (stun_servers, forbidden_addresses) = self.node_fact_parts();
+        let self_key = self.self_key();
+        let boot_id = self.boot_id;
+        let generation = self.generation;
+        let flags = self.record_flags_for(relationship);
+        let punch_offer_deadline = self.punch_offer_deadline_for(relationship);
+
+        let ready = {
+            let Some(peer) = self.peers.get(&relationship) else {
+                return;
+            };
+            let facts = NodeFacts {
+                ntfy_handle: self.ntfy_handle.as_ref(),
+                engines: self.engines.as_ref(),
+                state: &self.state,
+                signing_key: &self.signing_key,
+                public: &self.public,
+                transports: &self.transports,
+                boot_id,
+                generation,
+                self_key,
+                stun_servers: stun_servers.clone(),
+                forbidden_addresses: forbidden_addresses.clone(),
+                monotonic_ms: monotonic,
+                flags,
+                punch_offer_deadline,
+            };
+            peer.ntfy.subscribed
+                && !peer.ntfy.waiting()
+                && peer.public.request_due(monotonic)
+                && !facts.peer_is_healthy(peer, now)
+        };
+        if !ready {
+            return;
+        }
+
+        let request = match RequestId::random() {
+            Ok(request) => request,
             Err(error) => {
-                self.write_ntfy_detail(error.to_string());
+                if let Some(peer) = self.peers.get_mut(&relationship) {
+                    peer.ntfy.write_detail(error.to_string());
+                }
                 return;
             }
         };
-        if let Err(error) = self.exchange.register_request(id) {
-            self.write_ntfy_detail(error.to_string());
-            self.public.request_queue_failed(self.monotonic_ms());
+        if let Some(peer) = self.peers.get_mut(&relationship)
+            && let Err(error) = peer.exchange.register_request(request)
+        {
+            peer.ntfy.write_detail(error.to_string());
+            peer.public.request_queue_failed(monotonic);
             return;
         }
-        match self.queue_payload(MessageKind::Request, id) {
+
+        let facts = NodeFacts {
+            ntfy_handle: self.ntfy_handle.as_ref(),
+            engines: self.engines.as_ref(),
+            state: &self.state,
+            signing_key: &self.signing_key,
+            public: &self.public,
+            transports: &self.transports,
+            boot_id,
+            generation,
+            self_key,
+            stun_servers,
+            forbidden_addresses,
+            monotonic_ms: monotonic,
+            flags,
+            punch_offer_deadline,
+        };
+        let Some(peer) = self.peers.get_mut(&relationship) else {
+            return;
+        };
+        match facts.queue_payload(peer, MessageKind::Request, request) {
             Ok(expires_at) => {
-                self.public
-                    .request_started(id, expires_at, now_unix_ms(), self.monotonic_ms());
+                peer.public
+                    .request_started(request, expires_at, now, monotonic);
             }
             Err(error) => {
-                self.exchange.cancel_request(id);
-                self.public.request_queue_failed(self.monotonic_ms());
-                self.write_ntfy_detail(error);
+                peer.exchange.cancel_request(request);
+                peer.public.request_queue_failed(monotonic);
+                peer.ntfy.write_detail(error);
             }
         }
-    }
-
-    /// Build and queue a signed payload. Sequence persistence always precedes signing.
-    pub(super) fn queue_payload(
-        &mut self,
-        kind: MessageKind,
-        id: RequestId,
-    ) -> Result<u64, String> {
-        let now = now_unix_ms();
-        let candidates = publication_endpoints(self.public.own_mappings(self.monotonic_ms()))
-            .into_iter()
-            .map(|endpoint| RecordCandidate {
-                endpoint,
-                source: CandidateSource::Stun,
-            })
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Err(
-                "no fresh measured STUN mapping; refusing an empty contact record".to_owned(),
-            );
-        }
-        let durable = self
-            .state
-            .load_sequence()
-            .map_err(|error| error.to_string())?;
-        let highest_peer = self.peer_cache.highest_seq().unwrap_or(0);
-        let sequence = reserve_sequence(durable, highest_peer, now_unix_us())
-            .map_err(|error| error.to_string())?;
-        self.state
-            .store_sequence(sequence)
-            .map_err(|error| error.to_string())?;
-        let expires_at = self
-            .punch_offer_deadline()
-            .unwrap_or_else(|| now.saturating_add(MAX_LIFETIME_MS));
-        let record = ContactRecord {
-            relationship_id: self.resolved.relationship.relationship_id,
-            sender: self.resolved.relationship.self_public_key,
-            receiver: self.resolved.relationship.peer_public_key,
-            record_seq: sequence,
-            issued_at_unix_ms: now,
-            expires_at_unix_ms: expires_at,
-            boot_id: self.boot_id,
-            generation: self.generation,
-            candidates,
-            flags: self.record_flags(),
-        };
-        // No publish queueing or signing happens before the durable reservation above.
-        let payload = SignedPayload::sign(kind, id, &record, &self.signing_key)
-            .map_err(|error| error.to_string())?;
-        let handle = self
-            .ntfy_handle
-            .as_ref()
-            .ok_or_else(|| "ntfy transport is not running".to_owned())?;
-        handle
-            .try_publish(payload)
-            .map_err(|error| error.to_string())?;
-        Ok(expires_at)
     }
 }

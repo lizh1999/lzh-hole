@@ -21,11 +21,17 @@ mtu = 1200
 
 [ntfy]
 base_url = "https://ntfy.sh"
-# 必须等于 lzh-hole-v1-<relationship_id 的 32 个小写 hex 字符>，防止串用配对关系。
-# topic 不是身份凭据，也不能代替签名认证。
-topic = "lzh-hole-v1-00112233445566778899aabbccddeeff"
-# DNS 返回 Fake-IP 时才设置：把 base_url 的 hostname 解析到该公网 IPv4，
-# 仍保留 HTTPS hostname/SNI/证书校验，不修改系统 DNS/VPN/默认路由。
+# 不配置 topic。每条关系的 topic 由 daemon 从该关系的 relationship_id 推导
+# （lzh-hole-v1-<32 个小写 hex>），无法配错，也无法用来绕限流。
+# 一个 host 只有一个 ntfy actor 订阅全部关系，共用同一个「每 host 至少 30 秒」
+# 间隔和同一个 24 小时操作预算；关系数量不会提高操作速率。
+# 主机名不经过系统解析器：daemon 在绑定到选定物理接口的 UDP socket 上，向该
+# 接口自己的 IPv4 默认网关发一个受界的 IN/A 查询。系统解析器返回 Fake-IP
+# （198.18.0.0/15）因此不再影响信令，也不需要为此改系统 DNS/VPN/默认路由。
+# 仅当网关本身不提供 DNS 时才显式指定解析器：
+# dns_server = "192.168.31.1:53"
+# resolve_ip 是最后手段：把 base_url 的 hostname 钉死到某个公网 IPv4，仍保留
+# HTTPS hostname/SNI/证书校验。服务端换 IP 后必须手工更新，正常部署不要用。
 # resolve_ip = "159.203.148.75"
 
 [lan]

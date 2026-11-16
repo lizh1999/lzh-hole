@@ -3,10 +3,17 @@
 //! The adapter supplies complete normalized resolutions. Incomplete resolutions
 //! are not retained here; native resolution caches must also be bounded.
 //! Subnet, own-address and route checks remain service/protocol responsibilities.
+//!
+//! Several pinned peers may advertise at once. Every observation is resolved to
+//! exactly one relationship through its `pk` TXT field, and every update carries
+//! that relationship so a hint can only ever reach the engine that owns it.
 
-use std::{collections::BTreeMap, net::Ipv4Addr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv4Addr,
+};
 
-use lzh_hole_types::{DiscoveryPublicKey, Endpoint};
+use lzh_hole_types::{DiscoveryPublicKey, Endpoint, RelationshipId};
 
 use crate::observation::{
     CandidateHint, CandidateScope, DiscoveryOrigin, DiscoveryUpdate, HintSource, LanScope,
@@ -37,6 +44,13 @@ pub enum LanError {
 
 #[cfg(test)]
 mod tests;
+
+/// One update together with the relationship whose `pk` produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanUpdate {
+    pub relationship_id: RelationshipId,
+    pub update: DiscoveryUpdate,
+}
 
 /// DNS TXT wire bytes: length-prefixed strings, not a delimiter-joined string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,17 +96,24 @@ pub struct LanObservation {
     pub ttl_ms: u64,
 }
 
+/// A retained observation plus the relationship its `pk` resolved to.
+#[derive(Debug, Clone, Copy)]
+struct LanEntry {
+    relationship_id: RelationshipId,
+    hint: CandidateHint,
+}
+
 #[derive(Debug)]
 pub struct LanDiscovery {
-    peer_key: DiscoveryPublicKey,
-    observations: BTreeMap<(LanScope, String), CandidateHint>,
+    pinned: BTreeMap<DiscoveryPublicKey, RelationshipId>,
+    observations: BTreeMap<(LanScope, String), LanEntry>,
     next_id: u64,
 }
 
 impl LanDiscovery {
-    pub fn new(peer_key: DiscoveryPublicKey) -> Self {
+    pub fn new(pinned: BTreeMap<DiscoveryPublicKey, RelationshipId>) -> Self {
         Self {
-            peer_key,
+            pinned,
             observations: BTreeMap::new(),
             next_id: 1,
         }
@@ -104,7 +125,7 @@ impl LanDiscovery {
         &mut self,
         observation: LanObservation,
         now_ms: u64,
-    ) -> Result<Vec<DiscoveryUpdate>, LanError> {
+    ) -> Result<Vec<LanUpdate>, LanError> {
         if observation.instance.is_empty()
             || observation.instance.len() > MAX_INSTANCE_BYTES
             || observation
@@ -118,18 +139,23 @@ impl LanDiscovery {
         if observation.ttl_ms == 0 {
             return Ok(self.remove(&observation.instance, observation.scope));
         }
-        let remote = self.validate(&observation)?;
+        let (relationship_id, remote) = self.validate(&observation)?;
         let key = (observation.scope, observation.instance);
         let existing = self.observations.get(&key).copied();
-        if existing.is_none() && self.observations.len() >= MAX_LAN_OBSERVATIONS {
+        // Capacity is counted per relationship on purpose: one chatty peer must
+        // not be able to exhaust the observation or candidate budget that the
+        // other pinned relationships depend on. Reaching the limit for one
+        // relationship only refuses that relationship's new observations.
+        if existing.is_none() && self.observation_count_for(relationship_id) >= MAX_LAN_OBSERVATIONS
+        {
             return Err(LanError::Capacity);
         }
         let scope = CandidateScope::Lan(observation.scope);
-        let distinct: std::collections::BTreeSet<_> = self
+        let distinct: BTreeSet<_> = self
             .observations
             .iter()
-            .filter(|(k, _)| **k != key)
-            .map(|(_, hint)| (hint.scope, hint.remote))
+            .filter(|(k, entry)| **k != key && entry.relationship_id == relationship_id)
+            .map(|(_, entry)| (entry.hint.scope, entry.hint.remote))
             .chain(std::iter::once((scope, remote)))
             .collect();
         if distinct.len() > MAX_LAN_CANDIDATES {
@@ -137,12 +163,20 @@ impl LanDiscovery {
         }
         let mut updates = Vec::new();
         let id = match existing {
-            Some(old) if old.remote == remote => old.observation_id,
+            // A different endpoint or a different relationship is a different
+            // path: an observation id is never handed from one relationship to
+            // another, because the two engines key their registries separately.
+            Some(old) if old.hint.remote == remote && old.relationship_id == relationship_id => {
+                old.hint.observation_id
+            }
             old => {
                 let serial = self.next_id;
                 self.next_id = serial.checked_add(1).ok_or(LanError::Capacity)?;
                 if let Some(old) = old {
-                    updates.push(DiscoveryUpdate::Remove(old.observation_id));
+                    updates.push(LanUpdate {
+                        relationship_id: old.relationship_id,
+                        update: DiscoveryUpdate::Remove(old.hint.observation_id),
+                    });
                 }
                 ObservationId {
                     origin: DiscoveryOrigin::Lan,
@@ -157,12 +191,26 @@ impl LanDiscovery {
             expires_at_ms: now_ms.saturating_add(observation.ttl_ms.min(MAX_LAN_TTL_MS)),
             source: HintSource::Mdns,
         };
-        self.observations.insert(key, hint);
-        updates.push(DiscoveryUpdate::Upsert(hint));
+        self.observations.insert(
+            key,
+            LanEntry {
+                relationship_id,
+                hint,
+            },
+        );
+        updates.push(LanUpdate {
+            relationship_id,
+            update: DiscoveryUpdate::Upsert(hint),
+        });
         Ok(updates)
     }
 
-    fn validate(&self, observation: &LanObservation) -> Result<Endpoint, LanError> {
+    /// Resolve the advertising key to its pinned relationship, then validate the
+    /// rest of the advertisement exactly as before.
+    fn validate(
+        &self,
+        observation: &LanObservation,
+    ) -> Result<(RelationshipId, Endpoint), LanError> {
         if observation.txt.len() > MAX_LAN_TXT_BYTES
             || observation.addresses.len() > MAX_RESOLVED_ADDRESSES
             || observation.port == 0
@@ -186,9 +234,13 @@ impl LanDiscovery {
         if fields.get("v") != Some(&"1") {
             return Err(LanError::Version);
         }
-        if fields.get("pk").copied() != Some(self.peer_key.to_string().as_str()) {
-            return Err(LanError::WrongPeer);
-        }
+        let advertised = fields.get("pk").copied().ok_or(LanError::WrongPeer)?;
+        let relationship_id = self
+            .pinned
+            .iter()
+            .find(|(key, _)| key.to_string() == advertised)
+            .map(|(_, relationship_id)| *relationship_id)
+            .ok_or(LanError::WrongPeer)?;
         let address = fields
             .get("addr")
             .ok_or(LanError::Address)?
@@ -197,30 +249,38 @@ impl LanDiscovery {
         if !address.is_private() || !observation.addresses.contains(&address) {
             return Err(LanError::Address);
         }
-        Ok(Endpoint::new(address, observation.port))
+        Ok((relationship_id, Endpoint::new(address, observation.port)))
     }
 
-    pub fn remove(&mut self, instance: &str, scope: LanScope) -> Vec<DiscoveryUpdate> {
+    pub fn remove(&mut self, instance: &str, scope: LanScope) -> Vec<LanUpdate> {
         self.observations
             .remove(&(scope, instance.to_owned()))
-            .map(|hint| vec![DiscoveryUpdate::Remove(hint.observation_id)])
+            .map(|entry| {
+                vec![LanUpdate {
+                    relationship_id: entry.relationship_id,
+                    update: DiscoveryUpdate::Remove(entry.hint.observation_id),
+                }]
+            })
             .unwrap_or_default()
     }
 
     /// Revoke only this generation; a stale callback cannot revoke a new one.
-    pub fn revoke_interface(&mut self, scope: LanScope) -> Vec<DiscoveryUpdate> {
+    pub fn revoke_interface(&mut self, scope: LanScope) -> Vec<LanUpdate> {
         self.remove_where(|hint| hint.scope == CandidateScope::Lan(scope))
     }
 
-    pub fn expire(&mut self, now_ms: u64) -> Vec<DiscoveryUpdate> {
+    pub fn expire(&mut self, now_ms: u64) -> Vec<LanUpdate> {
         self.remove_where(|hint| hint.expires_at_ms <= now_ms)
     }
 
-    fn remove_where(&mut self, predicate: impl Fn(&CandidateHint) -> bool) -> Vec<DiscoveryUpdate> {
+    fn remove_where(&mut self, predicate: impl Fn(&CandidateHint) -> bool) -> Vec<LanUpdate> {
         let mut updates = Vec::new();
-        self.observations.retain(|_, hint| {
-            if predicate(hint) {
-                updates.push(DiscoveryUpdate::Remove(hint.observation_id));
+        self.observations.retain(|_, entry| {
+            if predicate(&entry.hint) {
+                updates.push(LanUpdate {
+                    relationship_id: entry.relationship_id,
+                    update: DiscoveryUpdate::Remove(entry.hint.observation_id),
+                });
                 false
             } else {
                 true
@@ -231,5 +291,12 @@ impl LanDiscovery {
 
     pub fn observation_count(&self) -> usize {
         self.observations.len()
+    }
+
+    pub fn observation_count_for(&self, relationship_id: RelationshipId) -> usize {
+        self.observations
+            .values()
+            .filter(|entry| entry.relationship_id == relationship_id)
+            .count()
     }
 }

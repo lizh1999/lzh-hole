@@ -2,7 +2,11 @@
 
 ## 1. 定位
 
-两台 Apple Silicon Mac 之间的 IPv4-over-UDP 直连：在固定虚拟 IPv4（VIP）之间透明承载 TCP、UDP 和 ICMP。数据面是明文 IPv4 + HMAC-SHA256，不做隧道加密、业务中继、出口节点或多节点 mesh。UDP 直连失败时如实离线，不退回 SSH/TCP/TURN/DERP。
+多台 Apple Silicon Mac 之间的全互联 IPv4-over-UDP mesh：在固定虚拟 IPv4（VIP）之间透明承载 TCP、UDP 和 ICMP。数据面是明文 IPv4 + HMAC-SHA256，不做隧道加密、业务中继或出口节点。UDP 直连失败时如实离线，不退回 SSH/TCP/TURN/DERP。
+
+拓扑是**全互联、逐对独立**：每两台机器之间一条独立关系，各自持有 PSK、握手 session、replay window、durable sequence、peer 高水位、anti-rollback 缓存、请求关联表和协调 topic。共享的只有节点级资源：身份密钥、自己的 VIP、物理 socket 池、STUN 测量、Bonjour 作用域和一条 utun。一个节点最多 8 个 peer（`MAX_PEERS`）。
+
+**不做转发或中继**：A 与 B 不通时不会借道 C。节点级聚合只用于诊断，绝不把部分健康报成健康。
 
 ## 2. crate 分层
 
@@ -41,14 +45,15 @@ CLI         → service, control, store, types
 
 ### daemon 模块
 
-- `daemon/mod.rs`：组件构造、事件循环、生命周期输入。
-- `daemon/discovery.rs`：Bonjour/公网模型接线、签名记录、durable seq、请求/回复与 native operation 生命周期。
-- `daemon/candidates.rs`：按 discovery `ObservationId` 合并线索、来源独立撤回、接口世代及 transport 作用域投影；不依赖 control DTO。
+- `daemon/mod.rs`：组件构造、事件循环、生命周期输入；持有 `peers`、一个 `PeerSet`、一个 ntfy actor 和一条 `OverlayRoutes`。
+- `daemon/peer.rs`：一条关系的全部运行时状态（协调、anti-rollback 缓存、sequence 流、请求关联、候选、计数），以及构建该关系签名记录所需的 `NodeFacts` 视图。
+- `daemon/discovery.rs`：节点级 Bonjour/STUN 接线，加上按 ntfy 事件携带的 relationship 分发的签名记录处理；一个 payload 只对一条关系验证。
+- `daemon/candidates.rs`：按 `(RelationshipId, ObservationId)` 合并线索、来源独立撤回、接口世代及 transport 作用域投影；观察与投影上限都按关系计算；不依赖 control DTO。
 - `daemon/transport.rs`：最多 8 个真实绑定 socket、永不复用的 transport ID（与打洞池共用同一分配器）、单个持久接收 buffer、轮转 poll；`adopt` 让打洞获胜 socket 保留原 ID 加入数据面。
-- `daemon/punch.rs`：临时打洞 socket 池（独立临时端口、有界、`Drop` 兜底）、独立令牌桶（默认 400 pps）、触发与角色判定、成功晋升与失败退避。
-- `daemon/dataplane.rs`：按实际 transport 收发，与 TUN 之间转发认证 IPv4。
-- `daemon/lifecycle.rs`：物理接口/所有 IPv4 alias 的选择、5 秒拓扑复查、局部失效与资源清理。
-- `daemon/status.rs`：doctor 快照与有界 drop 计数。
+- `daemon/punch.rs`：临时打洞 socket 池（独立临时端口、有界、`Drop` 兜底）、独立令牌桶（默认 400 pps）、触发与角色判定、成功晋升与失败退避；socket 池是节点级但每个 slot 记住属于哪条关系。
+- `daemon/dataplane.rs`：入向按 wire header 的 relationship 分流，出向按目的 VIP 选引擎；计数归到真正产生或消费流量的 peer，本层自己拒收的字节算节点级。
+- `daemon/lifecycle.rs`：物理接口/所有 IPv4 alias 的选择、5 秒拓扑复查、局部失效与资源清理；每次重投影为**每条**关系写入路径集（含空集）。
+- `daemon/status.rs`：逐 peer 观测 + 真正节点级的子系统；节点级 `current_path`/`candidates` 恒为空。
 
 ## 3. 打洞流程
 
@@ -70,7 +75,9 @@ Bonjour 使用 `_lzh-hole._udp.local.`，TXT 为 `v=1`、`pk`、`addr`，SRV por
 
 打洞与数据面完全隔离：PUNCH 用独立帧型与独立静态密钥 `k_punch`，有独立 outbox（512 帧）、独立速率预算（令牌桶，默认 400 pps、burst 100）和独立 socket 池；既不占 `ProbeBudget`，也不占 `MAX_UDP_OUTBOX`，不进 transcript、replay window 或任何序号空间。硬侧 socket 数（256）与易侧网格步长（128）是必须成对的协议常量——块宽不足步长两倍时网格会整块跨过，因此不暴露为配置项。PUNCH 绝不写入 `seen_probes`。
 
-打洞只在**没有健康路径**时启动，由 `start_punch` 单点强制；EDM↔EDM、任一侧映射行为未知、无公网候选、ntfy 阻塞期或退避期内均不启动，并在 doctor 中如实给出原因。硬侧窗口最多 180 秒以容纳限流发布和传播；开窗/关窗及映射分类变化都会刷新签名记录但不绕过 ntfy pacing。开窗记录过期时间不晚于实际窗口结束，易侧仅在收到仍有完整 30 秒扫描时间的有效 offer 后启动，网格发完后继续等待在途确认直至截止。命中时丢弃旧扫描队列，硬侧 slot 0 与易侧数据 slot 0 按角色分别解析；晋升 socket 有 30 秒握手宽限，未建链或失效后自动回收。失败一律如实离线，不降级、不兜底。
+全 mesh **同时最多一个打洞尝试**：socket 池是节点级描述符预算，一次扫描也只对一台对端的 NAT 有意义。其他想打洞的 peer 排队，`peer_punch_status` 如实报告排队原因而不是谎称在跑；退避、失败原因和队列原因都按关系独立保存，一条关系反复失败不会拖住另一条。
+
+打洞只在**该关系没有健康路径**时启动，由 `start_punch` 单点强制；EDM↔EDM、任一侧映射行为未知、无公网候选、ntfy 阻塞期或退避期内均不启动，并在 doctor 中如实给出原因。硬侧窗口最多 180 秒以容纳限流发布和传播；开窗/关窗及映射分类变化都会刷新签名记录但不绕过 ntfy pacing。开窗记录过期时间不晚于实际窗口结束，易侧仅在收到仍有完整 30 秒扫描时间的有效 offer 后启动，网格发完后继续等待在途确认直至截止。命中时丢弃旧扫描队列，硬侧 slot 0 与易侧数据 slot 0 按角色分别解析；晋升 socket 有 30 秒握手宽限，未建链或失效后自动回收。失败一律如实离线，不降级、不兜底。
 
 候选刷新保留未变路径的定时器。记录过期只撤销后续尝试资格，不终止健康会话；socket 消失才失效其路径。一侧发现可由认证 PROBE/入站握手完成连接；PROBE nonce 在有效期内有界去重，学习候选有效 120 秒。主动 HELLO/重传、PROBE、路径 PING 共用每关系 10/s、每路径 2/s 的滑动预算；正常健康、DATA 和有独立边界的认证即时回复不占主动探测预算。
 
@@ -83,19 +90,31 @@ Bonjour 使用 `_lzh-hole._udp.local.`，TXT 为 `v=1`、`pk`、`addr`，SRV por
 
 每个 IPv4 包或分片都检查总长度、header checksum 和双方 VIP。错误 VIP、错误方向、过期 session/epoch、错误来源和重放均 fail closed。
 
-只使用专用 utun 和对端 VIP 的一条 `/32` host route。utun destination 保持 unset，避免 macOS 抢先创建路由；route 只精确清理自己安装且仍匹配的条目。不改默认路由、DNS、PF 或现有 VPN。
+只使用一条专用 utun，以及**每个 peer 一条** `/32` host route。utun destination 保持 unset，避免 macOS 抢先创建路由；route 只精确清理自己安装且仍匹配的条目，从不安装前缀或默认路由。不改默认路由、DNS、PF 或现有 VPN。关闭时先清 route 再销毁 utun。
 
 ## 5. 身份、配对与信令
 
 - 身份为 Ed25519 seed 与 z-base-32 公钥；配对使用 pairing-v2 三步格式（offer / accept / finalize）。
 - VIP、双方公钥与 relationship ID 只来自 finalized 配对状态；配置文件中重复填写 VIP 或 PSK 会被拒绝。PSK 只存放于私有 state 目录（目录 0700、文件 0600）。
-- ntfy 只承载有界、签名的 `ContactRecord + kind + RequestId`，不承载业务包、PSK 或私钥。topic 必须为 `lzh-hole-v1-<relationship_id 小写 hex>`，它不是认证机制，HTTP 200 也不代表对端在线。
+- ntfy 只承载有界、签名的 `ContactRecord + kind + RequestId`，不承载业务包、PSK 或私钥。每条关系的 topic 恒为 `lzh-hole-v1-<relationship_id 小写 hex>`，**由代码从配对状态推导，配置文件里没有 topic 字段**（旧配置带 topic 会被 `deny_unknown_fields` 直接拒绝）。它不是认证机制，HTTP 200 也不代表对端在线。
+- 一个节点持有 N 条关系就有 N 份待完成 offer，按 pairing_id 分别存放（上限 8），因此并行的 `pair offer` 不会互相覆盖 PSK；finalize 按 acceptance/offer 里的 pairing_id 取回并删除对应 offer。
+- 同一节点内 peer key 与 peer VIP 各只能被一条关系占用，self VIP 在所有关系中必须一致，self 公钥必须与身份密钥一致；违反者在 `pair offer` 阶段就报错，`finalise` 再校验一次。
 - 联系记录 sequence 在构造/发布前 durable 预留，重启不倒退、不复用。新记录的 peer 高水位原子持久化成功后才使用其候选。
 - 缓存消息只作候选线索：不自动回复、不完成本地请求、不标记在线。
 
+### ntfy 主机名解析
+
+- ntfy 主机名**不经过系统解析器**。系统解析器可能返回 198.18.0.0/15 的 Fake-IP，这类地址只有在代理隧道正常时才可达，而信令通道不允许依赖一个可能随时失效的第三方隧道状态。
+- 解析由 `lzh-hole-net::dns` 完成：在绑定到选定物理接口（`IP_BOUND_IF`）的独立短期 UDP socket 上，向该接口自己的 IPv4 默认网关发一个递归 IN/A 问题。该 socket 与保留的物理 socket 池无关，源端口不同即映射不同，不会干扰已测得的 STUN 映射。
+- 默认网关从路由表读取（只读，不增删改任何路由），优先选取位于本接口某个前缀内的网关。接口未在配置中指定时，按内核快照顺序取第一个可用于该解析的物理适配器；只有 link-local 地址的适配器（awdl0/llw0 等）不参与候选。源地址必须与待查询的服务器同链路，第二个不相关别名不会被借用。
+- `[ntfy].dns_server` 可显式指定解析器（例如网关不提供 DNS 的网络），除此之外没有任何写死的第三方地址。
+- 编解码与查询全程受界：单问题、无 EDNS0、无 TCP 回退、不追 CNAME 链；响应 ≤512 字节，答案 ≤16 条，返回地址 ≤8 个，名字压缩指针只允许向后跳且 ≤8 次，每次尝试 ≤2 秒、默认 3 次尝试，确定性失败（NXDOMAIN、问题不匹配、截断）不重试，整个解析 ≤15 秒。
+- 解析结果在**建连之前**逐个校验：任何落入 `path::classify` 拒绝范围的地址（Fake-IP、私网、loopback、CGNAT、组播等）都会让整次解析失败，不会建立任何 TCP 连接，因此不会消耗签名记录、sequence 或 24 小时操作预算。诊断串会展平错误来源链，doctor 能直接看到具体拒绝原因。
+- HTTP 客户端禁用系统代理（`no_proxy`）：一次 host 操作不能悄悄变成另一台主机的操作。
+
 ### ntfy 限流
 
-- 每 host 的 subscribe、reconnect、publish 串行，间隔至少 30 秒；遵守 `Retry-After`（缺省 429 退避 5 分钟）和滚动 24 小时 128 次预算。
+- 每 host 只有一个 ntfy actor，订阅全部关系的 topic；subscribe、reconnect、publish 全部串行，间隔至少 30 秒。关系数量不会提高操作速率：无论多少条关系排队，每 30 秒只放行一次 host 操作，订阅与发布交替以防饿死。遵守 `Retry-After`（缺省 429 退避 5 分钟）和滚动 24 小时 128 次预算。
 - 收到合法 NDJSON open/keepalive/message 才算订阅就绪。持续健康 1 小时才重置重连退避；反复断流按 30 秒至 15 分钟指数退避。
 - 重连保留已发布请求的关联 ID 和签名过期时间，不重放旧签名。成功 live reply 后 45 分钟刷新；失败按 30 秒至 30 分钟指数退避。实际 mapping/transport 变化提前刷新并取消旧请求关联，完全相同的 STUN 刷新不加速请求；健康 LAN/公网路径抑制主动 request 而保留待刷新时序，回复仍可发送，始终受既有持久化 ntfy pacing 约束。发布至多 8 个去重映射，先覆盖各 transport 最新映射，再轮转补足历史映射。
 - 预算或 `Retry-After` 阻塞期间不生成新 request/reply；doctor 保留原始阻塞原因和 `not_before_unix_ms`，后续现象不覆盖它。
@@ -113,9 +132,9 @@ Bonjour 使用 `_lzh-hole._udp.local.`，TXT 为 `v=1`、`pk`、`addr`，SRV por
 
 ## 7. 控制接口
 
-私有 Unix socket，一行一个 JSON、每连接一个请求、最大 16 KiB，只接受 `{"command":"doctor"}`。目录 0700、socket 0600，属主为管理 UID，连接后再经 `peer_cred()` 只允许 root 或管理 UID。bind 时路径已存在即失败；正常退出只删除 device/inode 与本次 bind 相符的 socket。
+私有 Unix socket，一行一个 JSON、每连接一个请求、最大 128 KiB，只接受 `{"command":"doctor"}`。上限按饱和快照实测（8 peer × 32 候选 × 满长度 drop reason = 71022 字节）留余量确定，并由 `dto::tests::a_saturated_snapshot_fits_one_control_line` 钉住：调小帧上限而不调小那些边界会直接构建失败，而不是让 doctor 退化成一句 internal error。目录 0700、socket 0600，属主为管理 UID，连接后再经 `peer_cred()` 只允许 root 或管理 UID。bind 时路径已存在即失败；正常退出只删除 device/inode 与本次 bind 相符的 socket。
 
-doctor 返回 `daemon`、`lan`、`ntfy`、`stun`、`session`、`tun`、`routes`、`bytes`、带原因的 `drops`，独立的 `overlay.direct_reachable` / `currently_healthy`，以及 `punch`（`state`、`role`、`local_mapping`、`peer_mapping`、`blocked_by`、`last_failure`、`probes_sent`、`sockets_open`、`hit_port`、`started_unix_ms`；全部是观测值，不代表打洞会成功）。`current_path` 给出实际 transport ID、物理接口、本地/远端 endpoint 与 LAN/Public 类别；`candidates` 有界且不代表在线，`discovery` 计数独立于认证健康。未检测项为 `unknown` / `null`。严格未知字段校验要求 daemon 与 doctor 客户端一起升级。它不包含 `functional_pass` 或 `p0_qualified`，这些由外部验收判断。
+doctor 返回逐 peer 的 `peers[]`（每条关系一份 `relationship_id`、`peer_vip`、`peer_key`、`role`、`session`、`overlay`、`ntfy`、`current_path`、`candidates`、`punch`、`bytes`、`drops`），以及节点级的 `daemon`、`lan`、`ntfy`、`stun`、`session`、`tun`、`routes`、`bytes`、带原因的 `drops`，聚合的 `overlay.direct_reachable` / `currently_healthy`，以及 `punch`（`state`、`role`、`local_mapping`、`peer_mapping`、`blocked_by`、`last_failure`、`probes_sent`、`sockets_open`、`hit_port`、`started_unix_ms`；全部是观测值，不代表打洞会成功）。节点级 `current_path` 恒为 `null`、`candidates` 恒为空：一条路径只属于一个 peer，节点级取值只会有歧义。逐 peer 的 `current_path` 给出实际 transport ID、物理接口、本地/远端 endpoint 与 LAN/Public 类别；`candidates` 有界且不代表在线，`discovery` 计数独立于认证健康。未检测项为 `unknown` / `null`。聚合规则集中在 `ServiceSnapshot::set_peers`：布尔三态取 AND（任一 `false` 即 `false`，有未测即 `null`，全 `true` 才 `true`），session 取最差且 `unknown` 排在 `healthy` 之前，时间戳取最大；空列表被拒绝，调用全有或全无。严格未知字段校验要求 daemon 与 doctor 客户端一起升级。它不包含 `functional_pass` 或 `p0_qualified`，这些由外部验收判断。
 
 ## 8. 构建与离线分发
 
@@ -138,9 +157,9 @@ cargo xtask dist
 ./dist/install.sh --enable-service --allow-tun
 ~~~
 
-已有且已加载的服务在升级时会短暂重启；未加载的服务保持未加载。已有配置、定制 plist、身份、PSK、durable seq、peer 高水位与 ntfy pacing 不覆盖、不删除。定制的服务路径或参数不符合受支持布局时拒绝自动升级，不静默改写。按当前管理用户实际 UID 配置 `management_uid`，配对后配置对应 relationship 的 ntfy topic，不能直接用示例值启动。
+已有且已加载的服务在升级时会短暂重启；未加载的服务保持未加载。已有配置、定制 plist、身份、PSK、durable seq、peer 高水位与 ntfy pacing 不覆盖、不删除。定制的服务路径或参数不符合受支持布局时拒绝自动升级，不静默改写。按当前管理用户实际 UID 配置 `management_uid`。配置里没有 topic：每条关系的 topic 由 daemon 从 finalized 配对状态推导，因此示例配置可以直接用于任意节点，只需替换 `state_dir`、`control_socket` 和 `management_uid`。
 
-升级先暂存并校验新文件，以 `doctor --preflight --config /etc/lzh-hole/config.toml` 只读检查配置、现有私密目录/文件、身份与配对/topic 一致性。该模式不创建目录、不取 publisher writer 锁、不预留 sequence、不联网，也不输出私钥/PSK。停止旧服务后有界等待旧 PID、control socket、旧 utun 与 peer /32 route 清理，再替换二进制、核对哈希、恢复原服务运行状态。就绪检查要求 daemon/TUN/routes 已初始化，不要求对端在线；安装成功不等于功能或 P0 通过。
+升级先暂存并校验新文件，以 `doctor --preflight --config /etc/lzh-hole/config.toml` 只读检查配置、现有私密目录/文件、身份，以及**每一条**关系的 PSK 可读性与推导 topic 可用性。该模式不创建目录、不取 publisher writer 锁、不预留 sequence、不联网，也不输出私钥/PSK。停止旧服务后有界等待旧 PID、control socket、旧 utun 与 peer /32 route 清理，再替换二进制、核对哈希、恢复原服务运行状态。就绪检查要求 daemon/TUN/routes 已初始化，不要求对端在线；安装成功不等于功能或 P0 通过。
 
 失败时自动恢复旧二进制与原服务状态，但不回滚私密状态；清理或回滚失败则明确失败并保留 `/usr/local/libexec/.lzh-hole-install.lock` 内的备份，供人工恢复，不盲删网络资源或绕过 pacing。正常成功/回滚后删除临时备份。并发安装或上次遗留恢复目录会被拒绝。
 
@@ -148,4 +167,6 @@ home4 仍只接收本机生成的二进制，经 `ssh home4` 或 `ssh home-local
 
 ## 9. 离线测试范围
 
-固定 wire/auth/握手向量（`tests/fixtures/wire-v1.json`，格式见[协议](protocol.md)）、PONG 来源/transport/replay、双路径握手唯一赢家、IPv4 分片/VIP、配对与 ntfy 签名字节、私密持久化、STUN 严格解码、LAN 规范化及来源独立撤回/世代隔离、单进程离线 LAN 冷启动/公网故障隔离模拟、真实 loopback socket set/engine + 内存 TUN、doctor 清理。测试不发布组播/公网记录，不访问对端主机、不创建 OS utun、不执行 sudo；原生 Bonjour 双机发现、真实 TCP/UDP/ICMP 和 P0 仍须另行授权验收。
+固定 wire/auth/握手向量（`tests/fixtures/wire-v1.json`，格式见[协议](protocol.md)）、PONG 来源/transport/replay、双路径握手唯一赢家、IPv4 分片/VIP、配对与 ntfy 签名字节、私密持久化、STUN 严格解码、LAN 规范化及来源独立撤回/世代隔离、单进程离线 LAN 冷启动/公网故障隔离模拟、真实 loopback socket set/engine + 内存 TUN、doctor 清理。
+
+mesh 专项：三节点真实双握手与双向数据面（`protocol::mesh`）、多关系并行配对与 offer 按 pairing_id 隔离（`store`）、单 actor 多 topic 下「关系数不提高操作速率」与「一条流失败不抬高另一条关系退避」（`discovery`）、按关系隔离的候选容量与投影（`daemon::candidates`）、全 mesh 单打洞窗口与按关系排队/退避（`daemon::punch`）、聚合绝不上调健康与饱和快照帧大小（`control`）、一条 utun 多条 /32 的安装与回滚（`net::overlay`）。测试不发布组播/公网记录，不访问对端主机、不创建 OS utun、不执行 sudo；原生 Bonjour 双机发现、真实 TCP/UDP/ICMP 和 P0 仍须另行授权验收。

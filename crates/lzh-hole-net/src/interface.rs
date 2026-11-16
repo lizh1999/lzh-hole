@@ -72,6 +72,16 @@ impl Ipv4Prefix {
         })
     }
 
+    /// Whether an address lies inside this prefix, network and broadcast
+    /// addresses included.
+    pub fn contains(self, address: Ipv4Addr) -> bool {
+        if self.prefix_len > 32 {
+            return false;
+        }
+        let mask = prefix_mask(self.prefix_len);
+        u32::from(self.address) & mask == u32::from(address) & mask
+    }
+
     /// /1..=/30 wholly within RFC1918, excluding self/network/broadcast.
     pub fn contains_private_neighbor(self, destination: Ipv4Addr) -> bool {
         if !(1..=30).contains(&self.prefix_len)
@@ -365,6 +375,65 @@ fn routed_interface_indices(routes: &[Route], destinations: &[Ipv4Addr]) -> BTre
     usable
 }
 
+/// The IPv4 default gateway of one interface, read from the routing table.
+///
+/// Only the table is read; no route is added, changed or removed. An
+/// interface-scoped default route is what an IP_BOUND_IF socket can actually
+/// use, so this is also the only gateway such a socket may be pointed at.
+pub fn default_gateway_ipv4(interface: &str) -> io::Result<Ipv4Addr> {
+    let index = interface_index(interface)?;
+    let on_link = enumerate_snapshot()?
+        .into_iter()
+        .find(|snapshot| snapshot.interface.index == index)
+        .map(|snapshot| snapshot.ipv4_prefixes)
+        .unwrap_or_default();
+    let mut manager = RouteManager::new()?;
+    select_default_gateway(&manager.list()?, index, &on_link).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{interface} has no IPv4 default gateway"),
+        )
+    })
+}
+
+/// Pick the gateway an interface-scoped socket should use.
+///
+/// On-link gateways win over anything else, so a second, unrelated default
+/// route on the same interface cannot be chosen by accident. The result stays
+/// deterministic when several candidates remain.
+fn select_default_gateway(
+    routes: &[Route],
+    index: u32,
+    on_link: &[Ipv4Prefix],
+) -> Option<Ipv4Addr> {
+    let mut candidates: Vec<Ipv4Addr> = routes
+        .iter()
+        .filter(|route| {
+            route.if_index() == Some(index)
+                && route.prefix() == 0
+                && route.destination() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                && route.kind() == RouteKind::Unicast
+        })
+        .filter_map(|route| match route.gateway() {
+            Some(IpAddr::V4(gateway))
+                if !gateway.is_unspecified()
+                    && !gateway.is_loopback()
+                    && !gateway.is_multicast() =>
+            {
+                Some(gateway)
+            }
+            _ => None,
+        })
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+        .iter()
+        .copied()
+        .find(|gateway| on_link.iter().any(|prefix| prefix.contains(*gateway)))
+        .or_else(|| candidates.first().copied())
+}
+
 /// Resolve an interface name to its kernel index.
 pub fn interface_index(name: &str) -> io::Result<u32> {
     if_nametoindex(name).ok_or_else(|| {
@@ -493,6 +562,102 @@ mod tests {
                 interface.index,
                 destination,
                 routed.contains(&interface.index)
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_containment_includes_network_and_broadcast() {
+        let prefix = Ipv4Prefix {
+            address: Ipv4Addr::new(192, 168, 31, 167),
+            prefix_len: 24,
+        };
+        assert!(prefix.contains(Ipv4Addr::new(192, 168, 31, 0)));
+        assert!(prefix.contains(Ipv4Addr::new(192, 168, 31, 167)));
+        assert!(prefix.contains(Ipv4Addr::new(192, 168, 31, 255)));
+        assert!(!prefix.contains(Ipv4Addr::new(192, 168, 32, 1)));
+        assert!(!prefix.contains(Ipv4Addr::new(192, 168, 30, 255)));
+        assert!(
+            Ipv4Prefix {
+                address: Ipv4Addr::new(10, 0, 0, 1),
+                prefix_len: 33
+            }
+            .contains(Ipv4Addr::new(10, 0, 0, 1))
+            .eq(&false)
+        );
+    }
+
+    #[test]
+    fn default_gateway_prefers_an_on_link_unicast_route() {
+        let on_link = vec![Ipv4Prefix {
+            address: Ipv4Addr::new(192, 168, 31, 167),
+            prefix_len: 24,
+        }];
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_gateway(IpAddr::V4(Ipv4Addr::new(10, 8, 0, 1)))
+                .with_if_index(14),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 31, 1)))
+                .with_if_index(14),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 31, 2)))
+                .with_if_index(15),
+        ];
+        assert_eq!(
+            select_default_gateway(&routes, 14, &on_link),
+            Some(Ipv4Addr::new(192, 168, 31, 1))
+        );
+        // Without an on-link prefix the lowest candidate is still deterministic.
+        assert_eq!(
+            select_default_gateway(&routes, 14, &[]),
+            Some(Ipv4Addr::new(10, 8, 0, 1))
+        );
+        assert_eq!(
+            select_default_gateway(&routes, 15, &on_link),
+            Some(Ipv4Addr::new(192, 168, 31, 2))
+        );
+        assert_eq!(select_default_gateway(&routes, 99, &on_link), None);
+    }
+
+    #[test]
+    fn default_gateway_refuses_reject_routes_and_unusable_next_hops() {
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 31, 1)))
+                .with_if_index(14)
+                .with_kind(RouteKind::Unreachable),
+            // An on-link default route has no next hop and is not a gateway.
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).with_if_index(14),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_gateway(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                .with_if_index(14),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_gateway(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+                .with_if_index(14),
+            // A longer prefix is not a default route.
+            Route::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16)
+                .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 31, 1)))
+                .with_if_index(14),
+        ];
+        assert_eq!(select_default_gateway(&routes, 14, &[]), None);
+    }
+
+    /// Host-specific evidence, run explicitly with --ignored --nocapture.
+    /// No packets are sent and no route is changed.
+    #[test]
+    #[ignore = "prints the current host's read-only default gateways"]
+    fn inspect_default_gateways() {
+        for snapshot in enumerate_snapshot().expect("getifaddrs") {
+            let interface = &snapshot.interface;
+            if !interface.is_physical_candidate() || interface.is_loopback {
+                continue;
+            }
+            println!(
+                "{} index={} gateway={:?}",
+                interface.name,
+                interface.index,
+                default_gateway_ipv4(&interface.name)
             );
         }
     }

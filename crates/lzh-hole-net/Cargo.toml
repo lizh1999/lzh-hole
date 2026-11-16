@@ -10,6 +10,7 @@ description = "macOS interface, bound UDP, utun and route adapters"
 workspace = true
 
 [dependencies]
+getrandom.workspace = true
 libc.workspace = true
 route_manager = { version = "=0.2.17", default-features = false }
 socket2 = { workspace = true, features = ["all"] }
@@ -18,5 +19,4 @@ tokio = { workspace = true, features = ["net"] }
 tun-rs = { version = "=2.8.18", default-features = false, features = ["async_tokio"] }
 
 [dev-dependencies]
-getrandom.workspace = true
 tempfile.workspace = true

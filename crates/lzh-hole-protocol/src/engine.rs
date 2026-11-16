@@ -303,6 +303,20 @@ enum QueueError {
     Wire(WireError),
 }
 
+/// Maximum overlay and coordination addresses refused as candidate targets.
+///
+/// The list is scanned linearly for every inbound datagram and every candidate
+/// admission, so it is bounded rather than merely "small".
+pub const MAX_FORBIDDEN_ADDRESSES: usize = 64;
+
+/// Why a candidate policy could not be tightened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyError {
+    /// The bounded forbidden-address list is already full.
+    #[error("the bounded forbidden address list is full")]
+    ForbiddenAddressesFull,
+}
+
 /// One authenticated peer with no socket, TUN or async runtime ownership.
 pub struct PeerEngine {
     hs: Handshake,
@@ -410,6 +424,80 @@ impl PeerEngine {
         self.set_paths(&paths)
     }
 
+    /// Add addresses which must never become candidate targets for this peer.
+    ///
+    /// An engine only knows its own two overlay addresses. A composition layer
+    /// holding several peers is therefore the only place that can keep one
+    /// peer's overlay address out of another peer's candidate set.
+    ///
+    /// This tightens the policy, so every retained candidate, pending handshake
+    /// path, return-path probe, queued frame and session the new policy forbids
+    /// is dropped before returning. Tightening the policy without re-applying
+    /// it to existing state would leave an address that is nominally forbidden
+    /// still in active use.
+    ///
+    /// Existing entries are preserved and duplicates ignored. The list is
+    /// bounded; a request that would exceed the bound changes nothing.
+    pub(crate) fn forbid_addresses(&mut self, extra: &[Ipv4Addr]) -> Result<(), PolicyError> {
+        if !self.can_forbid(extra) {
+            return Err(PolicyError::ForbiddenAddressesFull);
+        }
+        for address in extra {
+            if !self.policy.forbidden_addresses.contains(address) {
+                self.policy.forbidden_addresses.push(*address);
+            }
+        }
+        self.prune_disallowed_paths();
+        Ok(())
+    }
+
+    /// Whether every address could still be added to the bounded list.
+    pub(crate) fn can_forbid(&self, extra: &[Ipv4Addr]) -> bool {
+        let added = extra
+            .iter()
+            .filter(|address| !self.policy.forbidden_addresses.contains(address))
+            .count();
+        self.policy.forbidden_addresses.len() + added <= MAX_FORBIDDEN_ADDRESSES
+    }
+
+    /// Drop every retained candidate, pending path, probe, queued frame and
+    /// session that the current candidate policy no longer permits.
+    fn prune_disallowed_paths(&mut self) {
+        let candidates = std::mem::take(&mut self.candidates);
+        self.candidates = candidates
+            .into_iter()
+            .filter(|c| self.may_path(c.path, c.kind))
+            .collect();
+        for path in self.hs.pending_paths() {
+            if !self.may_source(path) {
+                self.hs.remove_path(path);
+            }
+        }
+        let probes = std::mem::take(&mut self.path_probes);
+        self.path_probes = probes
+            .into_iter()
+            .filter(|p| self.may_source(p.path))
+            .collect();
+        let pings = std::mem::take(&mut self.ping_paths);
+        self.ping_paths = pings
+            .into_iter()
+            .filter(|(_, path)| self.may_source(*path))
+            .collect();
+        if self.session_path.is_some_and(|p| !self.may_source(p)) {
+            self.invalidate_session();
+        }
+        let queued = std::mem::take(&mut self.udp_out);
+        self.udp_out = queued
+            .into_iter()
+            .filter(|f| {
+                self.may_source(PathEndpoint {
+                    transport: f.transport,
+                    remote: f.target,
+                })
+            })
+            .collect();
+    }
+
     /// Replace trusted socket facts. Omitted sockets are explicitly removed.
     /// At most sixteen policies and sixteen subnets per socket are retained.
     pub fn set_transports(&mut self, policies: &[TransportPolicy]) {
@@ -452,29 +540,7 @@ impl PeerEngine {
                 self.remove_transport(transport);
             }
         }
-        let candidates = std::mem::take(&mut self.candidates);
-        self.candidates = candidates
-            .into_iter()
-            .filter(|c| self.may_path(c.path, c.kind))
-            .collect();
-        for path in self.hs.pending_paths() {
-            if !self.may_source(path) {
-                self.hs.remove_path(path);
-            }
-        }
-        if self.session_path.is_some_and(|p| !self.may_source(p)) {
-            self.invalidate_session();
-        }
-        let queued = std::mem::take(&mut self.udp_out);
-        self.udp_out = queued
-            .into_iter()
-            .filter(|f| {
-                self.may_source(PathEndpoint {
-                    transport: f.transport,
-                    remote: f.target,
-                })
-            })
-            .collect();
+        self.prune_disallowed_paths();
     }
 
     /// Replace discovery hints without resetting unchanged candidates' timers.
@@ -647,11 +713,27 @@ impl PeerEngine {
     /// Refused whenever a path is already selected or a session exists: a
     /// punch must never preempt a working path. This is the single place that
     /// rule is enforced.
+    ///
+    /// The target is validated here too. A punch sends real datagrams to
+    /// `peer_endpoint` from a dedicated socket pool, which deliberately does
+    /// not go through candidate admission, so an overlay address, another
+    /// relationship's peer address or any other forbidden address must never
+    /// become a punch target for this relationship.
     pub fn start_punch(&mut self, config: PunchConfig, now_ms: u64) -> bool {
         if self.closed || self.punch.is_some() {
             return false;
         }
         if self.selected.is_some() || self.hs.session().is_some() {
+            return false;
+        }
+        let target = config.peer_endpoint;
+        if config.relationship_id != self.relationship_id
+            || target.ip == self.self_vip
+            || target.ip == self.peer_vip
+            || self.policy.forbidden_addresses.contains(&target.ip)
+            || self.policy.own_endpoints.contains(&target)
+            || self.policy.stun_servers.contains(&target)
+        {
             return false;
         }
         let key = self.hs.punch_key();

@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "lzh-hole",
     version,
-    about = "Direct-only IPv4-over-UDP networking for two paired macOS hosts",
+    about = "Direct-only IPv4-over-UDP networking for a mesh of paired macOS hosts",
     long_about = "No business traffic is relayed through a third party.\n\
                   Payload is authenticated with HMAC-SHA256 but NOT encrypted."
 )]
@@ -42,11 +42,11 @@ pub(crate) struct InitArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum PairAction {
-    /// Create an offer containing a fresh relationship PSK.
+    /// Create an offer containing a fresh relationship PSK for one peer.
     Offer(PairOfferArgs),
     /// Accept an offer, binding your own public key to it.
     Accept(PairAcceptArgs),
-    /// Verify the acceptance and finalise the relationship locally.
+    /// Verify the acceptance and finalise this one relationship locally.
     Finalize(PairFinalizeArgs),
 }
 
@@ -55,7 +55,7 @@ pub(crate) struct PairOfferArgs {
     /// Your state directory.
     #[arg(long)]
     pub(crate) state: PathBuf,
-    /// Expected responder public key, z-base-32 or hex.
+    /// Expected responder public key, z-base-32 or hex. One relationship per peer.
     #[arg(long)]
     pub(crate) peer_key: String,
     /// Your overlay address.
@@ -114,7 +114,7 @@ pub(crate) struct DaemonArgs {
     /// Explicit non-secret service TOML. VIPs and peer identity come from pairing.
     #[arg(long)]
     pub(crate) config: PathBuf,
-    /// Explicitly permit creating utun and its one owned peer /32 route.
+    /// Explicitly permit creating utun and one owned /32 route per peer.
     #[arg(long)]
     pub(crate) allow_tun: bool,
 }

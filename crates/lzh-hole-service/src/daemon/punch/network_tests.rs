@@ -1,11 +1,40 @@
 //! Explicit, unprivileged single-process / two-physical-uplink experiment.
 //! Uses real STUN and production sockets, punch coordinator, promotion and
-//! PeerEngine. Signed records are passed in memory, NOT through public ntfy.
+//! PeerSet. Signed records are passed in memory, NOT through public ntfy.
 //! No TUN, routes, DNS, PF, VPN, launchd or existing identities are touched.
+//!
+//! Each daemon here pins exactly one relationship, so every punch accessor is
+//! called with that relationship id. The mesh-wide invariants this file cannot
+//! exercise -- one attempt at a time, queueing, per-relationship backoff -- are
+//! covered by the unit tests in the parent module.
 
 use super::*;
+use lzh_hole_discovery::candidate::CandidateSource;
+use lzh_hole_discovery::record::{
+    ContactRecord, MAX_LIFETIME_MS, RecordCandidate, reserve_sequence,
+};
+use lzh_hole_discovery::{Delivery, MessageKind};
+use lzh_hole_protocol::engine::PeerEngine;
+use lzh_hole_protocol::mesh::PeerSet;
 use lzh_hole_store::{PAIRING_VERSION, Relationship, Role};
-use lzh_hole_types::RelationshipId;
+use lzh_hole_types::{DiscoveryPublicKey, RelationshipId, Secret32};
+
+/// The one relationship this daemon pins.
+fn rel(daemon: &Daemon) -> RelationshipId {
+    *daemon
+        .peer_order
+        .first()
+        .expect("this harness pins exactly one relationship")
+}
+
+fn engine_of(daemon: &mut Daemon, relationship: RelationshipId) -> &mut PeerEngine {
+    daemon
+        .engines
+        .as_mut()
+        .expect("mesh engines")
+        .get_mut(relationship)
+        .expect("the relationship's own engine")
+}
 
 fn peer(
     interface: &str,
@@ -43,8 +72,7 @@ fn peer(
         "116.162.157.195:3478".parse().unwrap(),
         "111.206.174.3:3478".parse().unwrap(),
     ];
-    config.ntfy.topic = topic_for_relationship(&relationship_id);
-    let resolved = config.resolve(relationship).unwrap();
+    let resolved = config.resolve(vec![relationship.clone()]).unwrap();
     let (snapshots, _) = watch::channel(ServiceSnapshot::starting(1, now_unix_ms()));
     let mut daemon = Daemon::new(
         resolved,
@@ -53,9 +81,45 @@ fn peer(
         snapshots,
     )
     .unwrap();
-    daemon.engine = Some(
-        lifecycle::make_engine(&daemon.resolved, psk, daemon.boot_id, daemon.generation).unwrap(),
-    );
+
+    // One relationship, one engine, built here rather than through the daemon so
+    // this experiment does not depend on the offline component injection.
+    let mut engines = PeerSet::new(daemon.resolved.self_vip, local);
+    let stun_servers = daemon
+        .resolved
+        .config
+        .stun_seeds
+        .iter()
+        .map(|server| endpoint(*server))
+        .collect::<Vec<_>>();
+    engines
+        .insert(
+            EngineConfig {
+                handshake: HandshakeConfig {
+                    relationship_id,
+                    me: local,
+                    peer: other,
+                    boot_id: daemon.boot_id,
+                    generation: daemon.generation,
+                },
+                self_vip: daemon.resolved.self_vip,
+                peer_vip: if first {
+                    "10.203.0.2".parse().unwrap()
+                } else {
+                    "10.203.0.1".parse().unwrap()
+                },
+                candidate_policy: CandidatePolicy {
+                    own_endpoints: Vec::new(),
+                    forbidden_addresses: Vec::new(),
+                    stun_servers,
+                    require_public_unicast: true,
+                },
+            },
+            psk,
+        )
+        .unwrap();
+    daemon.engines = Some(engines);
+
     daemon.topology = enumerate_interface_prefixes().unwrap();
     let address = daemon
         .topology
@@ -78,14 +142,20 @@ fn peer(
 }
 
 fn signed_record(daemon: &mut Daemon) -> SignedPayload {
+    let relationship = rel(daemon);
     let now = now_unix_ms();
+    let highest_peer = daemon
+        .peers
+        .get(&relationship)
+        .and_then(|peer| peer.peer_cache.highest_seq())
+        .unwrap_or(0);
     let seq = reserve_sequence(
-        daemon.state.load_sequence().unwrap(),
-        daemon.peer_cache.highest_seq().unwrap_or(0),
+        daemon.state.load_sequence(relationship).unwrap(),
+        highest_peer,
         now_unix_us(),
     )
     .unwrap();
-    daemon.state.store_sequence(seq).unwrap();
+    daemon.state.store_sequence(relationship, seq).unwrap();
     let candidates =
         discovery::publication_endpoints(daemon.public.own_mappings(daemon.monotonic_ms()))
             .into_iter()
@@ -94,19 +164,26 @@ fn signed_record(daemon: &mut Daemon) -> SignedPayload {
                 source: CandidateSource::Stun,
             })
             .collect();
+    let (sender, receiver) = {
+        let peer = daemon.peers.get(&relationship).expect("pinned peer");
+        (
+            peer.relationship.self_public_key,
+            peer.relationship.peer_public_key,
+        )
+    };
     let record = ContactRecord {
-        relationship_id: daemon.resolved.relationship.relationship_id,
-        sender: daemon.resolved.relationship.self_public_key,
-        receiver: daemon.resolved.relationship.peer_public_key,
+        relationship_id: relationship,
+        sender,
+        receiver,
         record_seq: seq,
         issued_at_unix_ms: now,
         expires_at_unix_ms: daemon
-            .punch_offer_deadline()
+            .punch_offer_deadline_for(relationship)
             .unwrap_or(now + MAX_LIFETIME_MS),
         boot_id: daemon.boot_id,
         generation: daemon.generation,
         candidates,
-        flags: daemon.record_flags(),
+        flags: daemon.record_flags_for(relationship),
     };
     SignedPayload::sign(
         MessageKind::Request,
@@ -118,20 +195,23 @@ fn signed_record(daemon: &mut Daemon) -> SignedPayload {
 }
 
 async fn exchange(a: &mut Daemon, b: &mut Daemon) {
+    let rel_a = rel(a);
+    let rel_b = rel(b);
     let from_a = signed_record(a);
     let from_b = signed_record(b);
-    a.handle_signed_payload(from_b, Delivery::Cached, "in-memory-test-record")
+    a.handle_signed_payload(rel_a, from_b, Delivery::Cached, "in-memory-test-record")
         .await;
-    b.handle_signed_payload(from_a, Delivery::Cached, "in-memory-test-record")
+    b.handle_signed_payload(rel_b, from_a, Delivery::Cached, "in-memory-test-record")
         .await;
     assert!(
-        !a.paths.is_empty() && !b.paths.is_empty(),
+        a.paths.get(&rel_a).is_some_and(|paths| !paths.is_empty())
+            && b.paths.get(&rel_b).is_some_and(|paths| !paths.is_empty()),
         "real interface routes must authorize both public candidates"
     );
     // Do not let advertised-port HELLO/PROBE shortcuts masquerade as punching.
     // Only endpoints learned from a received PUNCH can seed the handshake.
-    a.engine.as_mut().unwrap().set_paths(&[]);
-    b.engine.as_mut().unwrap().set_paths(&[]);
+    engine_of(a, rel_a).set_paths(&[]);
+    engine_of(b, rel_b).set_paths(&[]);
 }
 
 async fn pump(
@@ -140,6 +220,8 @@ async fn pump(
     duration: Duration,
     until_healthy: bool,
 ) -> Vec<(usize, Vec<u8>)> {
+    let rel_a = rel(a);
+    let rel_b = rel(b);
     let deadline = Instant::now() + duration;
     let mut ticker = tokio::time::interval(ENGINE_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -150,7 +232,7 @@ async fn pump(
             _ = ticker.tick() => {
                 for daemon in [&mut *a, &mut *b] {
                     let now = now_unix_ms();
-                    daemon.engine.as_mut().unwrap().tick(now);
+                    daemon.engines.as_mut().unwrap().tick(now);
                     daemon.maybe_start_punch(now);
                     daemon.drive_punch(now);
                     daemon.maybe_start_stun().await;
@@ -161,17 +243,22 @@ async fn pump(
             punch = a.punch_sockets.recv() => a.handle_punch_udp(punch, now_unix_ms()),
             punch = b.punch_sockets.recv() => b.handle_punch_udp(punch, now_unix_ms()),
         }
-        for (index, daemon) in [&mut *a, &mut *b].into_iter().enumerate() {
-            while let Some(packet) = daemon.engine.as_mut().unwrap().next_ipv4_packet() {
+        for (index, (daemon, relationship)) in
+            [(&mut *a, rel_a), (&mut *b, rel_b)].into_iter().enumerate()
+        {
+            while let Some(packet) = engine_of(daemon, relationship).next_ipv4_packet() {
                 packets.push((index, packet));
             }
             daemon.drain_engine().await;
             daemon.drain_punch(now_unix_ms()).await;
         }
         if until_healthy
-            && [a.engine.as_ref().unwrap(), b.engine.as_ref().unwrap()]
-                .iter()
-                .all(|engine| engine.snapshot(now_unix_ms()).currently_healthy)
+            && engine_of(a, rel_a)
+                .snapshot(now_unix_ms())
+                .currently_healthy
+            && engine_of(b, rel_b)
+                .snapshot(now_unix_ms())
+                .currently_healthy
         {
             break;
         }
@@ -214,13 +301,15 @@ async fn en0_en8_real_udp_punch() {
     let mut secret = [0; 32];
     getrandom::fill(&mut secret).unwrap();
     let psk = Secret32::from_bytes(secret);
-    let rel = RelationshipId::from_bytes(*BootId::random().unwrap().as_bytes());
+    let relationship = RelationshipId::from_bytes(*BootId::random().unwrap().as_bytes());
     let key_a =
         DiscoveryPublicKey::from_bytes(SigningKey::from_bytes(&seed_a).verifying_key().to_bytes());
     let key_b =
         DiscoveryPublicKey::from_bytes(SigningKey::from_bytes(&seed_b).verifying_key().to_bytes());
-    let (_state_a, mut a) = peer("en0", &seed_a, key_b, &psk, rel, true);
-    let (_state_b, mut b) = peer("en8", &seed_b, key_a, &psk, rel, false);
+    let (_state_a, mut a) = peer("en0", &seed_a, key_b, &psk, relationship, true);
+    let (_state_b, mut b) = peer("en8", &seed_b, key_a, &psk, relationship, false);
+    let rel_a = rel(&a);
+    let rel_b = rel(&b);
     pump(&mut a, &mut b, Duration::from_secs(20), false).await;
     println!("scope=single-process/two-real-uplinks signaling=in-memory-signed-records tun=none");
     for (name, daemon) in [("en0", &a), ("en8", &b)] {
@@ -249,21 +338,40 @@ async fn en0_en8_real_udp_punch() {
         a.punch_offer_active() || b.punch_offer_active(),
         "hard side must open real sockets"
     );
+    // Exactly one relationship exists here, so at most one attempt may run and
+    // its window must belong to that relationship.
+    for daemon in [&a, &b] {
+        let relationship = rel(daemon);
+        if let Some(attempt) = daemon.punch.as_ref() {
+            assert_eq!(attempt.relationship, relationship);
+        }
+        if daemon.punch_offer_active() {
+            assert_eq!(daemon.punch_offer_relationship(), Some(relationship));
+        }
+    }
     // Deliberately delayed offer delivery, rather than simultaneous starts.
     exchange(&mut a, &mut b).await;
     pump(&mut a, &mut b, Duration::from_secs(45), true).await;
-    for (name, daemon) in [("en0", &a), ("en8", &b)] {
+    for (name, daemon, relationship) in [("en0", &a, rel_a), ("en8", &b, rel_b)] {
         println!(
             "{name}: punch={:?} engine={:?}",
-            daemon.punch_status(),
-            daemon.engine.as_ref().unwrap().snapshot(now_unix_ms())
+            daemon.peer_punch_status(relationship),
+            daemon
+                .engines
+                .as_ref()
+                .unwrap()
+                .get(relationship)
+                .unwrap()
+                .snapshot(now_unix_ms())
         );
     }
-    for daemon in [&a, &b] {
+    for (daemon, relationship) in [(&a, rel_a), (&b, rel_b)] {
         assert!(
             daemon
-                .engine
+                .engines
                 .as_ref()
+                .unwrap()
+                .get(relationship)
                 .unwrap()
                 .snapshot(now_unix_ms())
                 .currently_healthy,
@@ -274,16 +382,20 @@ async fn en0_en8_real_udp_punch() {
         !a.promoted_transports.is_empty() || !b.promoted_transports.is_empty(),
         "a real hard-side socket must have been promoted"
     );
-    let a_packet = ipv4_udp(a.resolved.self_vip, a.resolved.peer_vip, 0xa1);
-    let b_packet = ipv4_udp(b.resolved.self_vip, b.resolved.peer_vip, 0xb2);
-    a.engine
-        .as_mut()
-        .unwrap()
+    let a_packet = ipv4_udp(
+        a.resolved.self_vip,
+        a.peers.get(&rel_a).unwrap().peer_vip,
+        0xa1,
+    );
+    let b_packet = ipv4_udp(
+        b.resolved.self_vip,
+        b.peers.get(&rel_b).unwrap().peer_vip,
+        0xb2,
+    );
+    engine_of(&mut a, rel_a)
         .send_ipv4(&a_packet, now_unix_ms())
         .unwrap();
-    b.engine
-        .as_mut()
-        .unwrap()
+    engine_of(&mut b, rel_b)
         .send_ipv4(&b_packet, now_unix_ms())
         .unwrap();
     a.drain_engine().await;

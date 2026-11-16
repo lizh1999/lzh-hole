@@ -1,3 +1,15 @@
+//! Physical socket ownership, per-relationship path projection and shutdown.
+//!
+//! Physical sockets, STUN measurements and Bonjour scopes are node-level: they
+//! describe this host's own network, not any peer. What is per relationship is
+//! the projected path set, because a path is only ever usable by the engine
+//! that owns the relationship whose authenticated record or pinned-key
+//! advertisement produced it.
+//!
+//! Every reprojection writes a path set for **every** relationship, including an
+//! empty one. Skipping a relationship with no surviving candidates would leave
+//! its engine holding paths that discovery has already withdrawn.
+
 use super::*;
 
 impl Daemon {
@@ -108,16 +120,17 @@ impl Daemon {
             }
         }
         self.sync_engine_transports();
-        self.refresh_public_request();
+        self.refresh_public_requests();
         self.reproject_candidates();
         self.ensure_mdns();
     }
 
-    /// Publish the current socket set to the engine.
+    /// Publish the current socket set to every peer engine.
     ///
-    /// Extracted from `refresh_network` so a promoted punch socket can join
-    /// the data plane without re-enumerating interfaces, retiring transports
-    /// or resetting Bonjour scopes in the middle of a promotion.
+    /// Physical sockets are a node-level resource, so one socket change is
+    /// applied to every relationship at once. That can rebuild every session
+    /// together, which is a deliberate availability trade: the alternative is
+    /// per-engine policy divergence inside one node.
     pub(super) fn sync_engine_transports(&mut self) {
         let policies = self
             .transports
@@ -149,8 +162,8 @@ impl Daemon {
                 }
             })
             .collect::<Vec<_>>();
-        if let Some(engine) = &mut self.engine {
-            engine.set_transports(&policies);
+        if let Some(engines) = &mut self.engines {
+            engines.set_transports(&policies);
         }
     }
 
@@ -158,9 +171,18 @@ impl Daemon {
         let index = self.transports.get(id).map(|socket| socket.interface_index);
         if self.transports.remove(id) {
             self.promoted_transports.remove(&id);
+            if self
+                .promoted_slot
+                .as_ref()
+                .is_some_and(|(_, _, slot)| *slot == id)
+            {
+                self.promoted_slot = None;
+            }
             self.public.remove_transport(id.0);
-            if let Some(engine) = &mut self.engine {
-                engine.remove_transport(id);
+            if let Some(engines) = &mut self.engines {
+                for (_, engine) in engines.iter_mut() {
+                    engine.remove_transport(id);
+                }
             }
             let scope_retired = index.is_some_and(|index| {
                 !self
@@ -191,16 +213,21 @@ impl Daemon {
                 && let Some(scope) = index.and_then(|index| self.lan_scopes.remove(&index))
             {
                 let transports = self.candidate_transports();
-                for update in self.lan.revoke_interface(scope) {
-                    self.registry.apply(update, &transports);
-                }
+                let updates = self
+                    .lan
+                    .revoke_interface(scope)
+                    .into_iter()
+                    .map(|update| (update.relationship_id, update.update))
+                    .collect::<Vec<_>>();
+                self.apply_tagged_updates_with(updates, &transports);
             }
-            self.paths
-                .retain(|candidate| candidate.path.transport != id);
+            for paths in self.paths.values_mut() {
+                paths.retain(|candidate| candidate.path.transport != id);
+            }
             if self.mdns_operations.is_empty() {
                 self.mdns = None;
             }
-            self.refresh_public_request();
+            self.refresh_public_requests();
             self.next_interface_check = Instant::now() + RECOVERY_RETRY;
         }
     }
@@ -223,51 +250,101 @@ impl Daemon {
             .collect()
     }
 
+    /// Reproject every relationship's paths from the current observation set.
+    ///
+    /// A relationship with no surviving candidate gets an explicitly empty path
+    /// set. That is what actually withdraws a path from its engine; leaving the
+    /// previous set in place would keep a withdrawn candidate usable.
     pub(super) fn reproject_candidates(&mut self) {
         let transports = self.candidate_transports();
+        let self_vip = self.resolved.self_vip;
+        let peer_vips = self
+            .peers
+            .values()
+            .map(|peer| peer.peer_vip)
+            .collect::<Vec<_>>();
+        let bound: Vec<Ipv4Addr> = self
+            .transports
+            .iter()
+            .map(|socket| *socket.local.ip())
+            .collect();
         let mut public_routes = BTreeMap::new();
+        let projected =
+            self.registry
+                .project(&transports, self.monotonic_ms(), |transport, hint| {
+                    // No overlay address of this mesh is ever a physical target,
+                    // whichever relationship the hint belongs to.
+                    if hint.remote.ip == self_vip
+                        || peer_vips.contains(&hint.remote.ip)
+                        || bound.contains(&hint.remote.ip)
+                    {
+                        return false;
+                    }
+                    match hint.scope {
+                        CandidateScope::Lan(_) => self
+                            .topology
+                            .iter()
+                            .find(|snapshot| snapshot.interface.index == transport.scope.interface)
+                            .is_some_and(|snapshot| {
+                                has_scoped_direct_route_from(
+                                    snapshot,
+                                    transport.local.ip,
+                                    hint.remote.ip,
+                                )
+                                .unwrap_or(false)
+                            }),
+                        CandidateScope::Public => public_routes
+                            .entry(hint.remote.ip)
+                            .or_insert_with(|| {
+                                ipv4_route_sources(&self.topology, hint.remote.ip)
+                                    .unwrap_or_default()
+                            })
+                            .contains(&(transport.scope.interface, transport.local.ip)),
+                    }
+                });
+
         self.paths = self
-            .registry
-            .project(&transports, self.monotonic_ms(), |transport, hint| {
-                if hint.remote.ip == self.resolved.self_vip
-                    || hint.remote.ip == self.resolved.peer_vip
-                    || self
-                        .transports
-                        .iter()
-                        .any(|socket| *socket.local.ip() == hint.remote.ip)
-                {
-                    return false;
+            .peer_order
+            .iter()
+            .map(|relationship| {
+                (
+                    *relationship,
+                    projected.get(relationship).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+
+        if let Some(engines) = &mut self.engines {
+            for (relationship, paths) in &self.paths {
+                if let Some(engine) = engines.get_mut(*relationship) {
+                    engine.set_paths(paths);
                 }
-                match hint.scope {
-                    CandidateScope::Lan(_) => self
-                        .topology
-                        .iter()
-                        .find(|snapshot| snapshot.interface.index == transport.scope.interface)
-                        .is_some_and(|snapshot| {
-                            has_scoped_direct_route_from(
-                                snapshot,
-                                transport.local.ip,
-                                hint.remote.ip,
-                            )
-                            .unwrap_or(false)
-                        }),
-                    CandidateScope::Public => public_routes
-                        .entry(hint.remote.ip)
-                        .or_insert_with(|| {
-                            ipv4_route_sources(&self.topology, hint.remote.ip).unwrap_or_default()
-                        })
-                        .contains(&(transport.scope.interface, transport.local.ip)),
-                }
-            });
-        if let Some(engine) = &mut self.engine {
-            engine.set_paths(&self.paths);
+            }
         }
     }
 
-    pub(super) fn apply_discovery_updates(&mut self, updates: Vec<DiscoveryUpdate>) {
+    pub(super) fn apply_tagged_updates(&mut self, updates: Vec<(RelationshipId, DiscoveryUpdate)>) {
         let transports = self.candidate_transports();
-        for update in updates {
-            self.registry.apply(update, &transports);
+        self.apply_tagged_updates_with(updates, &transports);
+    }
+
+    pub(super) fn apply_tagged_updates_with(
+        &mut self,
+        updates: Vec<(RelationshipId, DiscoveryUpdate)>,
+        transports: &[CandidateTransport],
+    ) {
+        if updates.is_empty() {
+            return;
+        }
+        for (relationship, update) in updates {
+            // A hint is only ever recorded against the relationship that
+            // authenticated it. An unknown relationship is refused rather than
+            // attributed to an arbitrary peer.
+            if !self.peers.contains_key(&relationship) {
+                self.record_drop("unknown_relationship_update", 1);
+                continue;
+            }
+            self.registry.apply(relationship, update, transports);
         }
         self.reproject_candidates();
     }
@@ -278,65 +355,45 @@ impl Daemon {
         if let Some(handle) = &self.ntfy_handle {
             handle.cancel();
         }
-        if let Some(engine) = &mut self.engine {
-            engine.close();
+        if let Some(engines) = &mut self.engines {
+            engines.close();
         }
         self.stop_punch(now_unix_ms());
         self.mdns = None;
         self.mdns_operations.clear();
         self.transports.clear();
         self.promoted_transports.clear();
-        if let Some(tunnel) = self.tunnel.take() {
-            if let Err(error) = tunnel.close() {
-                self.tun_status = component(
-                    ComponentState::Failed,
-                    format!("utun/route cleanup failed: {error}"),
-                    self.tun_status.last_success_unix_ms,
-                );
-                self.route_status = self.tun_status.clone();
-            } else {
-                self.tun_status.state = ComponentState::Stopped;
-                self.route_status.state = ComponentState::Stopped;
+        self.promoted_slot = None;
+        // Routes are removed before utun, by OverlayRoutes' own field order and
+        // by its explicit close path.
+        if let Some(overlay) = self.overlay.take() {
+            let owned = overlay.peers().collect::<Vec<_>>();
+            match overlay.close() {
+                Ok(()) => {
+                    self.tun_status.state = ComponentState::Stopped;
+                    self.route_status.state = ComponentState::Stopped;
+                    self.route_status.detail = Some(format!(
+                        "removed every owned peer /32 route ({}) before closing utun",
+                        owned
+                            .iter()
+                            .map(|peer| format!("{peer}/32"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Err(error) => {
+                    self.tun_status = component(
+                        ComponentState::Failed,
+                        format!("utun/route cleanup failed: {error}"),
+                        self.tun_status.last_success_unix_ms,
+                    );
+                    self.route_status = self.tun_status.clone();
+                }
             }
         }
         self.snapshot.daemon.state = DaemonState::Stopped;
         self.publish_snapshot();
     }
-}
-
-pub(super) fn make_engine(
-    resolved: &ResolvedConfig,
-    psk: &Secret32,
-    boot_id: BootId,
-    generation: u64,
-) -> Result<PeerEngine, DaemonError> {
-    let mut engine = PeerEngine::new(
-        EngineConfig {
-            handshake: HandshakeConfig {
-                relationship_id: resolved.relationship.relationship_id,
-                me: resolved.relationship.self_public_key,
-                peer: resolved.relationship.peer_public_key,
-                boot_id,
-                generation,
-            },
-            self_vip: resolved.self_vip,
-            peer_vip: resolved.peer_vip,
-            candidate_policy: CandidatePolicy {
-                own_endpoints: Vec::new(),
-                forbidden_addresses: vec![resolved.self_vip, resolved.peer_vip],
-                stun_servers: resolved
-                    .config
-                    .stun_seeds
-                    .iter()
-                    .map(|server| endpoint(*server))
-                    .collect(),
-                require_public_unicast: true,
-            },
-        },
-        psk,
-    )?;
-    engine.set_transports(&[]);
-    Ok(engine)
 }
 
 fn record_interface_failure(failures: &mut BTreeMap<String, u64>, interface_name: &str) {
@@ -351,6 +408,10 @@ pub(super) fn ordered_physical_interfaces_from(
     failures: &BTreeMap<String, u64>,
 ) -> Result<Vec<(String, Ipv4Addr)>, DaemonError> {
     let config = &resolved.config;
+    // No overlay address of this mesh may be used as a physical bind address.
+    let overlay: Vec<Ipv4Addr> = std::iter::once(resolved.self_vip)
+        .chain(resolved.peers.iter().map(|peer| peer.peer_vip))
+        .collect();
     let mut candidates = match &config.interface {
         Some(name) => vec![
             interfaces
@@ -393,8 +454,7 @@ pub(super) fn ordered_physical_interfaces_from(
         }
         for ip in &chosen.ipv4 {
             if config.bind_ip.is_some_and(|bound| bound != *ip)
-                || *ip == resolved.self_vip
-                || *ip == resolved.peer_vip
+                || overlay.contains(ip)
                 || !matches!(
                     lzh_hole_discovery::candidate::classify(*ip),
                     None | Some(

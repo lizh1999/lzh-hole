@@ -1,35 +1,71 @@
 use lzh_hole_control::{ComponentState, ControlResponse, DaemonState};
-use lzh_hole_store::{PAIRING_VERSION, Relationship, Role};
-use lzh_hole_types::RelationshipId;
+use lzh_hole_discovery::candidate::CandidateSource;
+use lzh_hole_discovery::record::{ContactRecord, MAX_LIFETIME_MS, RecordCandidate};
+use lzh_hole_discovery::{Delivery, MessageKind};
+use lzh_hole_protocol::engine::{CandidatePolicy, EngineConfig};
+use lzh_hole_protocol::handshake::HandshakeConfig;
+use lzh_hole_protocol::mesh::PeerSet;
+use lzh_hole_store::{PAIRING_VERSION, Relationship, Role, public_key_of_seed};
+use lzh_hole_types::{DiscoveryPublicKey, RelationshipId, Secret32};
 
 use super::*;
 use crate::config::NtfyConfig as FileNtfyConfig;
+
+/// One overlay address per node, identical in every relationship.
+const SELF_VIP: &str = "10.203.0.1";
+const PEER_VIP: &str = "10.203.0.2";
+const SELF_SEED: [u8; 32] = [7; 32];
+/// A real Ed25519 seed, so a test can actually sign records as the peer.
+const PEER_SEED: [u8; 32] = [8; 32];
+const PSK: [u8; 32] = [0x5a; 32];
 
 fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() }
 }
 
-fn relationship(seed: &[u8; 32]) -> Relationship {
-    let signing = SigningKey::from_bytes(seed);
+fn self_vip() -> Ipv4Addr {
+    SELF_VIP.parse().unwrap()
+}
+
+fn peer_vip() -> Ipv4Addr {
+    PEER_VIP.parse().unwrap()
+}
+
+fn self_key() -> DiscoveryPublicKey {
+    public_key_of_seed(&SELF_SEED)
+}
+
+fn peer_key() -> DiscoveryPublicKey {
+    public_key_of_seed(&PEER_SEED)
+}
+
+fn peer_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&PEER_SEED)
+}
+
+fn relationship() -> Relationship {
     Relationship {
         pairing_version: PAIRING_VERSION,
         pairing_id: RelationshipId::from_bytes([1; 16]),
         relationship_id: RelationshipId::from_bytes([2; 16]),
-        self_public_key: DiscoveryPublicKey::from_bytes(signing.verifying_key().to_bytes()),
-        peer_public_key: DiscoveryPublicKey::from_bytes([9; 32]),
+        self_public_key: self_key(),
+        peer_public_key: peer_key(),
         role: Role::Initiator,
-        self_vip: "10.203.0.1".to_owned(),
-        peer_vip: "10.203.0.2".to_owned(),
+        self_vip: SELF_VIP.to_owned(),
+        peer_vip: PEER_VIP.to_owned(),
         finalised_unix_ms: 1,
     }
 }
 
-pub(super) fn resolved_for_test(interface: Option<&str>) -> ResolvedConfig {
-    let relationship = relationship(&[7u8; 32]);
+fn service_config(
+    state_dir: PathBuf,
+    control_socket: PathBuf,
+    interface: Option<&str>,
+) -> ServiceConfig {
     ServiceConfig {
-        state_dir: PathBuf::from("/var/db/lzh-hole-test"),
-        control_socket: PathBuf::from("/var/run/lzh-hole-test/control.sock"),
+        state_dir,
+        control_socket,
         management_uid: effective_uid(),
         interface: interface.map(str::to_owned),
         bind_ip: None,
@@ -37,15 +73,98 @@ pub(super) fn resolved_for_test(interface: Option<&str>) -> ResolvedConfig {
         stun_seeds: vec![SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 3478)],
         ntfy: FileNtfyConfig {
             base_url: "https://ntfy.sh".to_owned(),
-            topic: topic_for_relationship(&relationship.relationship_id),
             resolve_ip: None,
+            dns_server: None,
         },
         lan: crate::config::LanConfig::default(),
         mtu: 1200,
         punch: crate::config::PunchConfig::default(),
     }
-    .resolve(relationship)
+}
+
+/// A single-peer resolved config.
+///
+/// `punch::network_tests` depends on this exact signature, so keep it.
+pub(super) fn resolved_for_test(interface: Option<&str>) -> ResolvedConfig {
+    service_config(
+        PathBuf::from("/var/db/lzh-hole-test"),
+        PathBuf::from("/var/run/lzh-hole-test/control.sock"),
+        interface,
+    )
+    .resolve(vec![relationship()])
     .unwrap()
+}
+
+/// The engine set `Daemon::new` would build, for tests that need real engines
+/// without `--allow-tun`.
+fn peer_set_for(
+    resolved: &ResolvedConfig,
+    psk: &Secret32,
+    boot_id: BootId,
+    generation: u64,
+) -> PeerSet {
+    let me = self_key();
+    let forbidden = std::iter::once(resolved.self_vip)
+        .chain(resolved.peers.iter().map(|peer| peer.peer_vip))
+        .collect::<Vec<_>>();
+    let stun_servers = resolved
+        .config
+        .stun_seeds
+        .iter()
+        .map(|server| endpoint(*server))
+        .collect::<Vec<_>>();
+    let mut set = PeerSet::new(resolved.self_vip, me);
+    for peer in &resolved.peers {
+        set.insert(
+            EngineConfig {
+                handshake: HandshakeConfig {
+                    relationship_id: peer.relationship_id(),
+                    me,
+                    peer: peer.peer_key(),
+                    boot_id,
+                    generation,
+                },
+                self_vip: resolved.self_vip,
+                peer_vip: peer.peer_vip,
+                candidate_policy: CandidatePolicy {
+                    own_endpoints: Vec::new(),
+                    forbidden_addresses: forbidden.clone(),
+                    stun_servers: stun_servers.clone(),
+                    require_public_unicast: true,
+                },
+            },
+            psk,
+        )
+        .unwrap();
+    }
+    set
+}
+
+/// The mirror side of the same relationship: same ids and PSK, roles swapped.
+fn mirror_peer_set(psk: &Secret32, boot_id: BootId, generation: u64) -> PeerSet {
+    let mut set = PeerSet::new(peer_vip(), peer_key());
+    set.insert(
+        EngineConfig {
+            handshake: HandshakeConfig {
+                relationship_id: relationship().relationship_id,
+                me: peer_key(),
+                peer: self_key(),
+                boot_id,
+                generation,
+            },
+            self_vip: peer_vip(),
+            peer_vip: self_vip(),
+            candidate_policy: CandidatePolicy {
+                own_endpoints: Vec::new(),
+                forbidden_addresses: vec![self_vip(), peer_vip()],
+                stun_servers: Vec::new(),
+                require_public_unicast: true,
+            },
+        },
+        psk,
+    )
+    .unwrap();
+    set
 }
 
 fn physical(name: &str, index: u32, ip: Ipv4Addr) -> InterfaceInfo {
@@ -62,11 +181,9 @@ fn physical(name: &str, index: u32, ip: Ipv4Addr) -> InterfaceInfo {
 pub(super) fn offline_daemon() -> (tempfile::TempDir, Daemon) {
     let temp = tempfile::tempdir().unwrap();
     let state = StateDir::open(&temp.path().join("state")).unwrap();
-    let seed = [7u8; 32];
-    state.store_seed(&seed).unwrap();
-    let relationship = relationship(&seed);
+    state.store_seed(&SELF_SEED).unwrap();
     state
-        .finalise(&relationship, &Secret32::from_bytes([0x5a; 32]))
+        .finalise(&relationship(), &Secret32::from_bytes(PSK))
         .unwrap();
     let mut resolved = resolved_for_test(None);
     resolved.config.state_dir = state.path().to_path_buf();
@@ -82,14 +199,28 @@ pub(super) fn offline_daemon() -> (tempfile::TempDir, Daemon) {
     (temp, daemon)
 }
 
+/// The only relationship these fixtures hold.
+fn only(daemon: &Daemon) -> RelationshipId {
+    daemon.peer_order[0]
+}
+
+fn peer_of(daemon: &Daemon) -> &PeerRuntime {
+    &daemon.peers[&only(daemon)]
+}
+
+fn peer_of_mut(daemon: &mut Daemon) -> &mut PeerRuntime {
+    let id = daemon.peer_order[0];
+    daemon.peers.get_mut(&id).unwrap()
+}
+
 fn contact_record_for(
-    daemon: &Daemon,
+    relationship: RelationshipId,
     sender: DiscoveryPublicKey,
     receiver: DiscoveryPublicKey,
 ) -> ContactRecord {
     let now = now_unix_ms();
     ContactRecord {
-        relationship_id: daemon.resolved.relationship.relationship_id,
+        relationship_id: relationship,
         sender,
         receiver,
         record_seq: now_unix_us(),
@@ -115,31 +246,13 @@ async fn injected_offline_components_support_doctor_and_clean_shutdown() {
 async fn offline_control_roundtrip() {
     let temp = tempfile::tempdir().unwrap();
     let state = StateDir::open(&temp.path().join("state")).unwrap();
-    let seed = [7u8; 32];
-    state.store_seed(&seed).unwrap();
-    let relationship = relationship(&seed);
+    state.store_seed(&SELF_SEED).unwrap();
     state
-        .finalise(&relationship, &Secret32::from_bytes([0x5a; 32]))
+        .finalise(&relationship(), &Secret32::from_bytes(PSK))
         .unwrap();
     let socket_path = temp.path().join("control").join("control.sock");
-    let config = ServiceConfig {
-        state_dir: state.path().to_path_buf(),
-        control_socket: socket_path.clone(),
-        management_uid: effective_uid(),
-        interface: None,
-        bind_ip: None,
-        udp_port: 51000,
-        stun_seeds: vec![SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 3478)],
-        ntfy: FileNtfyConfig {
-            base_url: "https://ntfy.sh".to_owned(),
-            topic: topic_for_relationship(&relationship.relationship_id),
-            resolve_ip: None,
-        },
-        lan: crate::config::LanConfig::default(),
-        mtu: 1200,
-        punch: crate::config::PunchConfig::default(),
-    };
-    let resolved = config.resolve(relationship).unwrap();
+    let config = service_config(state.path().to_path_buf(), socket_path.clone(), None);
+    let resolved = config.resolve(vec![relationship()]).unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let task = tokio::task::spawn_local(run_async(
         resolved,
@@ -165,6 +278,13 @@ async fn offline_control_roundtrip() {
     assert_eq!(report.ntfy.state, ComponentState::NotConfigured);
     assert_eq!(report.tun.state, ComponentState::NotConfigured);
     assert_eq!(report.routes.state, ComponentState::NotConfigured);
+    // The peer list is what a mesh operator reads; the node-level aggregates
+    // must never be the only thing reported.
+    assert_eq!(report.peers.len(), 1);
+    assert_eq!(report.peers[0].peer_vip, PEER_VIP);
+    assert_eq!(report.peers[0].peer_key, peer_key().to_string());
+    assert!(report.current_path.is_none());
+    assert!(report.candidates.is_empty());
 
     shutdown_tx.send(true).unwrap();
     timeout(Duration::from_secs(5), task)
@@ -243,27 +363,40 @@ fn automatic_interface_rotation_reaches_a_third_candidate_and_respects_binding()
 #[tokio::test(flavor = "current_thread")]
 async fn stun_timeout_does_not_rebuild_the_data_transport() {
     let (_temp, mut daemon) = offline_daemon();
+    let rel = only(&daemon);
     let first = SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 3478);
     let second = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 3478);
-    daemon.engine = Some(
-        lifecycle::make_engine(
-            &daemon.resolved,
-            &Secret32::from_bytes([0x5a; 32]),
-            daemon.boot_id,
-            daemon.generation,
-        )
-        .unwrap(),
-    );
+    daemon.engines = Some(peer_set_for(
+        &daemon.resolved,
+        &Secret32::from_bytes(PSK),
+        daemon.boot_id,
+        daemon.generation,
+    ));
     daemon.public.add_transport(1, vec![first, second], 0);
     let boot = daemon.boot_id;
-    let snapshot = daemon.engine.as_ref().unwrap().snapshot(0);
+    let snapshot = daemon
+        .engines
+        .as_ref()
+        .unwrap()
+        .get(rel)
+        .unwrap()
+        .snapshot(0);
     daemon.public.start_stun(1, [1; 12], 0).unwrap();
-    daemon.public.expire(3_000);
+    daemon.public.expire_sockets(3_000);
     assert_eq!(daemon.public.consecutive_timeouts(1), Some(1));
     daemon.public.start_stun(1, [2; 12], 8_000).unwrap();
-    daemon.public.expire(11_000);
+    daemon.public.expire_sockets(11_000);
     assert_eq!(daemon.public.consecutive_timeouts(1), Some(2));
-    assert_eq!(daemon.engine.as_ref().unwrap().snapshot(0), snapshot);
+    assert_eq!(
+        daemon
+            .engines
+            .as_ref()
+            .unwrap()
+            .get(rel)
+            .unwrap()
+            .snapshot(0),
+        snapshot
+    );
     assert_eq!(daemon.boot_id, boot);
 }
 
@@ -301,116 +434,157 @@ fn offline_lan_interfaces_keep_all_ipv4_aliases_and_explicit_limits() {
 #[tokio::test(flavor = "current_thread")]
 async fn resubscribe_preserves_pending_request_and_retry_schedule() {
     let (_temp, mut daemon) = offline_daemon();
+    let rel = only(&daemon);
     let id = RequestId::from_hex("07070707070707070707070707070707").unwrap();
-    daemon.exchange.register_request(id).unwrap();
-    assert!(daemon.public.request_started(
-        id,
-        now_unix_ms() + 60_000,
-        now_unix_ms(),
-        daemon.monotonic_ms()
-    ));
-    let pending = daemon.public.pending_request();
+    let now = now_unix_ms();
+    let monotonic = daemon.monotonic_ms();
+    {
+        let peer = peer_of_mut(&mut daemon);
+        peer.exchange.register_request(id).unwrap();
+        assert!(
+            peer.public
+                .request_started(id, now + 60_000, now, monotonic)
+        );
+    }
+    let pending = peer_of(&daemon).public.pending_request();
     daemon
         .handle_ntfy(NtfyEvent::Subscribed {
+            relationship: rel,
             cached_replay: true,
         })
         .await;
     assert_eq!(
-        daemon.public.pending_request().map(|pending| pending.id),
+        peer_of(&daemon).public.pending_request().map(|p| p.id),
         Some(id)
     );
-    assert_eq!(daemon.public.pending_request(), pending);
-    assert!(!daemon.public.request_due(daemon.monotonic_ms()));
+    assert_eq!(peer_of(&daemon).public.pending_request(), pending);
+    let monotonic = daemon.monotonic_ms();
+    assert!(!peer_of(&daemon).public.request_due(monotonic));
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn budget_block_remains_visible_after_idle_and_publish_failure() {
     let (_temp, mut daemon) = offline_daemon();
+    let rel = only(&daemon);
     daemon
         .handle_ntfy(NtfyEvent::Error {
+            relationship: None,
             operation: NtfyOperation::Subscribe,
             detail: "ntfy rolling 24 hour operation budget of 128 exhausted".to_owned(),
             retry_after: Some(Duration::from_secs(10_000)),
         })
         .await;
-    let deadline = daemon.ntfy_block.as_ref().unwrap().not_before_unix_ms;
+    let deadline = peer_of(&daemon)
+        .ntfy
+        .block
+        .as_ref()
+        .unwrap()
+        .not_before_unix_ms;
     daemon
         .handle_ntfy(NtfyEvent::Error {
+            relationship: None,
             operation: NtfyOperation::Subscribe,
             detail: "ntfy subscription stream: no NDJSON data or keepalive".to_owned(),
             retry_after: Some(Duration::from_secs(9_000)),
         })
         .await;
-    let detail = daemon.ntfy_status.detail.as_deref().unwrap();
+    let detail = peer_of(&daemon).ntfy.status.detail.as_deref().unwrap();
     assert!(detail.contains("operation budget"), "{detail}");
     assert!(detail.contains("no NDJSON"), "{detail}");
     assert!(detail.contains(&deadline.to_string()), "{detail}");
     daemon
         .handle_ntfy(NtfyEvent::PublishFailed {
+            relationship: rel,
             kind: MessageKind::Reply,
             request_id: RequestId::from_hex("09090909090909090909090909090909").unwrap(),
             detail: "discarded while blocked".to_owned(),
         })
         .await;
-    let detail = daemon.ntfy_status.detail.as_deref().unwrap();
+    let detail = peer_of(&daemon).ntfy.status.detail.as_deref().unwrap();
     assert!(detail.contains("operation budget"), "{detail}");
     assert!(detail.contains("discarded while blocked"), "{detail}");
     assert!(detail.contains(&deadline.to_string()), "{detail}");
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_host_level_failure_never_marks_an_unrelated_relationship() {
+    // One node-level ntfy failure is reported against every relationship, but
+    // an attributed failure must stay on its own relationship. With a single
+    // peer there is nothing to leak into, so assert the attributed path is
+    // still refused for a relationship this node does not hold.
+    let (_temp, mut daemon) = offline_daemon();
+    let rel = only(&daemon);
+    daemon
+        .handle_ntfy(NtfyEvent::Error {
+            relationship: Some(rel),
+            operation: NtfyOperation::Publish,
+            detail: "attributed failure".to_owned(),
+            retry_after: None,
+        })
+        .await;
+    let detail = peer_of(&daemon).ntfy.status.detail.as_deref().unwrap();
+    assert!(detail.contains("attributed failure"), "{detail}");
+
+    let unknown = RelationshipId::from_bytes([0xee; 16]);
+    daemon
+        .handle_ntfy(NtfyEvent::Error {
+            relationship: Some(unknown),
+            operation: NtfyOperation::Publish,
+            detail: "must not be recorded".to_owned(),
+            retry_after: None,
+        })
+        .await;
+    let detail = peer_of(&daemon).ntfy.status.detail.as_deref().unwrap();
+    assert!(!detail.contains("must not be recorded"), "{detail}");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn matched_live_reply_schedules_refresh_instead_of_another_immediate_request() {
     let (_temp, mut daemon) = offline_daemon();
-    let peer_signing = SigningKey::from_bytes(&[8u8; 32]);
-    daemon.resolved.relationship.peer_public_key =
-        DiscoveryPublicKey::from_bytes(peer_signing.verifying_key().to_bytes());
+    let rel = only(&daemon);
     let id = RequestId::from_hex("07070707070707070707070707070707").unwrap();
-    daemon.exchange.register_request(id).unwrap();
-    assert!(daemon.public.request_started(
-        id,
-        now_unix_ms() + MAX_LIFETIME_MS,
-        now_unix_ms(),
-        daemon.monotonic_ms()
-    ));
-    let record = contact_record_for(
-        &daemon,
-        daemon.resolved.relationship.peer_public_key,
-        daemon.resolved.relationship.self_public_key,
-    );
-    let payload = SignedPayload::sign(MessageKind::Reply, id, &record, &peer_signing).unwrap();
+    let now = now_unix_ms();
+    let monotonic = daemon.monotonic_ms();
+    {
+        let peer = peer_of_mut(&mut daemon);
+        peer.exchange.register_request(id).unwrap();
+        assert!(
+            peer.public
+                .request_started(id, now + MAX_LIFETIME_MS, now, monotonic)
+        );
+    }
+    let record = contact_record_for(rel, peer_key(), self_key());
+    let payload =
+        SignedPayload::sign(MessageKind::Reply, id, &record, &peer_signing_key()).unwrap();
     daemon
-        .handle_signed_payload(payload, Delivery::Live, "reply-1")
+        .handle_signed_payload(rel, payload, Delivery::Live, "reply-1")
         .await;
-    assert!(daemon.public.pending_request().is_none());
-    assert!(
-        !daemon
-            .public
-            .request_due(daemon.monotonic_ms() + 44 * 60_000)
-    );
-    assert!(
-        daemon
-            .public
-            .request_due(daemon.monotonic_ms() + 46 * 60_000)
-    );
+    assert!(peer_of(&daemon).public.pending_request().is_none());
+    let monotonic = daemon.monotonic_ms();
+    assert!(!peer_of(&daemon).public.request_due(monotonic + 44 * 60_000));
+    assert!(peer_of(&daemon).public.request_due(monotonic + 46 * 60_000));
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn received_self_reject_and_verified_payload_preserve_the_active_block() {
     let (_temp, mut daemon) = offline_daemon();
+    let rel = only(&daemon);
     daemon
         .handle_ntfy(NtfyEvent::Error {
+            relationship: None,
             operation: NtfyOperation::Subscribe,
             detail: "ntfy rolling 24 hour operation budget of 128 exhausted".to_owned(),
             retry_after: Some(Duration::from_secs(10_000)),
         })
         .await;
-    let deadline = daemon.ntfy_block.as_ref().unwrap().not_before_unix_ms;
+    let deadline = peer_of(&daemon)
+        .ntfy
+        .block
+        .as_ref()
+        .unwrap()
+        .not_before_unix_ms;
 
-    let own_record = contact_record_for(
-        &daemon,
-        daemon.resolved.relationship.self_public_key,
-        daemon.resolved.relationship.peer_public_key,
-    );
+    let own_record = contact_record_for(rel, self_key(), peer_key());
     let own_payload = SignedPayload::sign(
         MessageKind::Request,
         RequestId::from_hex("01010101010101010101010101010101").unwrap(),
@@ -420,44 +594,44 @@ async fn received_self_reject_and_verified_payload_preserve_the_active_block() {
     .unwrap();
     daemon
         .handle_ntfy(NtfyEvent::Received {
+            relationship: rel,
             payload: own_payload,
             delivery: Delivery::Live,
             ntfy_id: "self-message".to_owned(),
         })
         .await;
-    let detail = daemon.ntfy_status.detail.as_deref().unwrap();
+    let detail = peer_of(&daemon).ntfy.status.detail.as_deref().unwrap();
     assert!(detail.contains("operation budget"), "{detail}");
     assert!(detail.contains("signed payload rejected"), "{detail}");
     assert!(detail.contains(&deadline.to_string()), "{detail}");
 
-    let peer_signing = SigningKey::from_bytes(&[8u8; 32]);
-    daemon.resolved.relationship.peer_public_key =
-        DiscoveryPublicKey::from_bytes(peer_signing.verifying_key().to_bytes());
-    let peer_record = contact_record_for(
-        &daemon,
-        daemon.resolved.relationship.peer_public_key,
-        daemon.resolved.relationship.self_public_key,
-    );
+    let peer_record = contact_record_for(rel, peer_key(), self_key());
     let peer_payload = SignedPayload::sign(
         MessageKind::Reply,
         RequestId::from_hex("02020202020202020202020202020202").unwrap(),
         &peer_record,
-        &peer_signing,
+        &peer_signing_key(),
     )
     .unwrap();
     daemon
         .handle_ntfy(NtfyEvent::Received {
+            relationship: rel,
             payload: peer_payload,
             delivery: Delivery::Cached,
             ntfy_id: "verified-message".to_owned(),
         })
         .await;
-    let detail = daemon.ntfy_status.detail.as_deref().unwrap();
+    let detail = peer_of(&daemon).ntfy.status.detail.as_deref().unwrap();
     assert!(detail.contains("operation budget"), "{detail}");
     assert!(detail.contains("verified ntfy message"), "{detail}");
     assert!(detail.contains(&deadline.to_string()), "{detail}");
     assert_eq!(
-        daemon.ntfy_block.as_ref().unwrap().not_before_unix_ms,
+        peer_of(&daemon)
+            .ntfy
+            .block
+            .as_ref()
+            .unwrap()
+            .not_before_unix_ms,
         deadline
     );
 }
@@ -479,13 +653,14 @@ fn file_pacing_store_distinguishes_missing_and_existing_state() {
 #[test]
 fn no_interface_engine_remains_diagnosable_without_wan_or_lan_candidates() {
     let resolved = resolved_for_test(None);
-    let engine = lifecycle::make_engine(
+    let rel = resolved.peers[0].relationship_id();
+    let engines = peer_set_for(
         &resolved,
-        &Secret32::from_bytes([0x5a; 32]),
+        &Secret32::from_bytes(PSK),
         BootId::from_bytes([1; 16]),
         1,
-    )
-    .unwrap();
+    );
+    let engine = engines.get(rel).unwrap();
     assert!(engine.snapshot(0).selected_path.is_none());
     assert!(!engine.snapshot(0).currently_healthy);
     assert!(
@@ -504,13 +679,8 @@ fn no_interface_engine_remains_diagnosable_without_wan_or_lan_candidates() {
 #[tokio::test(flavor = "current_thread")]
 async fn offline_lan_cold_start_survives_stun_and_ntfy_failure_and_hint_expiry() {
     let (_temp, mut daemon) = offline_daemon();
-    let psk = Secret32::from_bytes([0x5a; 32]);
-    let mut peer_config = daemon.resolved.clone();
-    std::mem::swap(
-        &mut peer_config.relationship.self_public_key,
-        &mut peer_config.relationship.peer_public_key,
-    );
-    std::mem::swap(&mut peer_config.self_vip, &mut peer_config.peer_vip);
+    let rel = only(&daemon);
+    let psk = Secret32::from_bytes(PSK);
     let local = Endpoint::new(Ipv4Addr::new(192, 168, 31, 156), 51000);
     let remote = Endpoint::new(Ipv4Addr::new(192, 168, 31, 7), 51000);
     let scope = LanScope {
@@ -522,11 +692,9 @@ async fn offline_lan_cold_start_survives_stun_and_ntfy_failure_and_hint_expiry()
         scope,
         local,
     };
-    let mut local_engine =
-        lifecycle::make_engine(&daemon.resolved, &psk, daemon.boot_id, 1).unwrap();
-    let mut peer =
-        lifecycle::make_engine(&peer_config, &psk, BootId::from_bytes([3; 16]), 1).unwrap();
-    local_engine.set_transports(&[TransportPolicy {
+    let mut local_set = peer_set_for(&daemon.resolved, &psk, daemon.boot_id, 1);
+    let mut peer_set = mirror_peer_set(&psk, BootId::from_bytes([3; 16]), 1);
+    local_set.set_transports(&[TransportPolicy {
         transport: TransportId(1),
         local_endpoint: local,
         lan_subnets: vec![LanSubnet {
@@ -534,7 +702,7 @@ async fn offline_lan_cold_start_survives_stun_and_ntfy_failure_and_hint_expiry()
             prefix_len: 24,
         }],
     }]);
-    peer.set_transports(&[TransportPolicy {
+    peer_set.set_transports(&[TransportPolicy {
         transport: TransportId(21),
         local_endpoint: remote,
         lan_subnets: vec![LanSubnet {
@@ -542,7 +710,7 @@ async fn offline_lan_cold_start_survives_stun_and_ntfy_failure_and_hint_expiry()
             prefix_len: 24,
         }],
     }]);
-    let ad = LanAdvertisement::new(daemon.resolved.relationship.peer_public_key, remote).unwrap();
+    let ad = LanAdvertisement::new(peer_key(), remote).unwrap();
     let updates = daemon
         .lan
         .observe(
@@ -557,10 +725,17 @@ async fn offline_lan_cold_start_survives_stun_and_ntfy_failure_and_hint_expiry()
             0,
         )
         .unwrap();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(
+        updates[0].relationship_id, rel,
+        "a pinned-key advertisement must land on exactly the relationship that pins it"
+    );
     for update in updates {
-        daemon.registry.apply(update, &[local_transport]);
+        daemon
+            .registry
+            .apply(rel, update.update, &[local_transport]);
     }
-    let paths = daemon
+    let projected = daemon
         .registry
         .project(&[local_transport], 0, |bound, hint| {
             LanSubnet {
@@ -569,11 +744,14 @@ async fn offline_lan_cold_start_survives_stun_and_ntfy_failure_and_hint_expiry()
             }
             .contains_host(hint.remote.ip)
         });
+    let paths = projected
+        .get(&rel)
+        .expect("one relationship projects paths");
     assert_eq!(paths.len(), 1);
-    local_engine.set_paths(&paths);
+    local_set.get_mut(rel).unwrap().set_paths(paths);
     // Only one side discovers the other. The peer has no discovery hints.
-    peer.set_paths(&[]);
-    daemon.engine = Some(local_engine);
+    peer_set.get_mut(rel).unwrap().set_paths(&[]);
+    daemon.engines = Some(local_set);
     daemon
         .public
         .add_transport(1, daemon.resolved.config.stun_seeds.clone(), 0);
@@ -582,19 +760,21 @@ async fn offline_lan_cold_start_survives_stun_and_ntfy_failure_and_hint_expiry()
     let mut now = start;
     for step in 0..200 {
         now = start + step * 250;
-        daemon.engine.as_mut().unwrap().tick(now);
-        peer.tick(now);
-        daemon.public.expire(step * 250);
+        daemon.engines.as_mut().unwrap().tick(now);
+        peer_set.tick(now);
+        daemon.public.expire_sockets(step * 250);
         for _ in 0..32 {
             let mut progress = false;
-            while let Some(frame) = daemon.engine.as_mut().unwrap().next_udp_frame() {
+            while let Some((owner, frame)) = daemon.engines.as_mut().unwrap().next_udp_frame() {
+                assert_eq!(owner, rel);
                 assert_eq!(frame.transport, TransportId(1));
-                peer.handle_datagram_on(TransportId(21), local, &frame.bytes, now);
+                peer_set.dispatch(TransportId(21), local, &frame.bytes, now);
                 progress = true;
             }
-            while let Some(frame) = peer.next_udp_frame() {
+            while let Some((owner, frame)) = peer_set.next_udp_frame() {
+                assert_eq!(owner, rel);
                 assert_eq!(frame.transport, TransportId(21));
-                daemon.engine.as_mut().unwrap().handle_datagram_on(
+                daemon.engines.as_mut().unwrap().dispatch(
                     TransportId(1),
                     remote,
                     &frame.bytes,
@@ -606,21 +786,28 @@ async fn offline_lan_cold_start_survives_stun_and_ntfy_failure_and_hint_expiry()
                 break;
             }
         }
-        if daemon
-            .engine
+        let local_healthy = daemon
+            .engines
             .as_ref()
             .unwrap()
+            .get(rel)
+            .unwrap()
             .snapshot(now)
-            .currently_healthy
-            && peer.snapshot(now).currently_healthy
-            && step >= 12
+            .currently_healthy;
+        if local_healthy && peer_set.get(rel).unwrap().snapshot(now).currently_healthy && step >= 12
         {
             break;
         }
     }
-    let healthy = daemon.engine.as_ref().unwrap().snapshot(now);
+    let healthy = daemon
+        .engines
+        .as_ref()
+        .unwrap()
+        .get(rel)
+        .unwrap()
+        .snapshot(now);
     assert!(healthy.currently_healthy);
-    assert!(peer.snapshot(now).currently_healthy);
+    assert!(peer_set.get(rel).unwrap().snapshot(now).currently_healthy);
     assert_eq!(daemon.public.consecutive_timeouts(1), Some(1));
     assert!(daemon.public.own_mappings(50_000).is_empty());
     // Enable only the synchronous request decision, not network housekeeping.
@@ -651,71 +838,103 @@ async fn offline_lan_cold_start_survives_stun_and_ntfy_failure_and_hint_expiry()
         .receive_stun(2, effect.server, &reply, monotonic)
         .unwrap()
         .unwrap();
-    daemon.refresh_public_request();
-    assert!(daemon.public.request_due(daemon.monotonic_ms()));
-    assert!(!daemon.public.own_mappings(daemon.monotonic_ms()).is_empty());
-    let sequence = daemon.state.load_sequence().unwrap();
+    daemon.refresh_public_requests();
+    let monotonic = daemon.monotonic_ms();
+    assert!(peer_of(&daemon).public.request_due(monotonic));
+    assert!(!daemon.public.own_mappings(monotonic).is_empty());
+    let sequence = daemon.state.load_sequence(rel).unwrap();
     daemon.network_enabled = true;
-    daemon.ntfy_subscribed = true;
-    daemon.maybe_queue_request();
-    assert_eq!(daemon.state.load_sequence().unwrap(), sequence);
-    assert!(daemon.public.pending_request().is_none());
+    peer_of_mut(&mut daemon).ntfy.subscribed = true;
+    daemon.maybe_queue_request_for(rel);
+    assert_eq!(daemon.state.load_sequence(rel).unwrap(), sequence);
+    assert!(peer_of(&daemon).public.pending_request().is_none());
+    let monotonic = daemon.monotonic_ms();
     assert!(
-        daemon.public.request_due(daemon.monotonic_ms()),
+        peer_of(&daemon).public.request_due(monotonic),
         "health suppression must leave refresh due"
     );
     daemon.network_enabled = false;
-    daemon.ntfy_subscribed = false;
+    peer_of_mut(&mut daemon).ntfy.subscribed = false;
     daemon
         .handle_ntfy(NtfyEvent::Error {
+            relationship: None,
             operation: NtfyOperation::Subscribe,
             detail: "offline".to_owned(),
             retry_after: Some(Duration::from_secs(60)),
         })
         .await;
-    assert_eq!(daemon.engine.as_ref().unwrap().snapshot(now), healthy);
+    assert_eq!(
+        daemon
+            .engines
+            .as_ref()
+            .unwrap()
+            .get(rel)
+            .unwrap()
+            .snapshot(now),
+        healthy
+    );
     for update in daemon.lan.expire(120_000) {
-        daemon.registry.apply(update, &[local_transport]);
+        daemon
+            .registry
+            .apply(update.relationship_id, update.update, &[local_transport]);
     }
     let expired = daemon
         .registry
         .project(&[local_transport], 120_000, |_, _| true);
-    assert!(expired.is_empty());
-    daemon.engine.as_mut().unwrap().set_paths(&expired);
+    // A relationship with no surviving observation is simply absent from the
+    // projection; `reproject_candidates` turns that absence into an explicitly
+    // empty path set, which is what actually withdraws the path.
+    let expired = expired.get(&rel).cloned().unwrap_or_default();
     assert!(
-        daemon
-            .engine
-            .as_ref()
-            .unwrap()
-            .snapshot(now)
-            .currently_healthy
-    );
-    assert_eq!(
-        daemon.engine.as_ref().unwrap().snapshot(now).selected_path,
-        healthy.selected_path
+        expired.is_empty(),
+        "withdrawn hints must project no path at all"
     );
     daemon
-        .engine
+        .engines
         .as_mut()
+        .unwrap()
+        .get_mut(rel)
+        .unwrap()
+        .set_paths(&expired);
+    let snapshot = daemon
+        .engines
+        .as_ref()
+        .unwrap()
+        .get(rel)
+        .unwrap()
+        .snapshot(now);
+    assert!(snapshot.currently_healthy);
+    assert_eq!(snapshot.selected_path, healthy.selected_path);
+    daemon
+        .engines
+        .as_mut()
+        .unwrap()
+        .get_mut(rel)
         .unwrap()
         .remove_transport(TransportId(99));
     assert!(
         daemon
-            .engine
+            .engines
             .as_ref()
+            .unwrap()
+            .get(rel)
             .unwrap()
             .snapshot(now)
             .currently_healthy
     );
     daemon
-        .engine
+        .engines
         .as_mut()
+        .unwrap()
+        .get_mut(rel)
         .unwrap()
         .remove_transport(TransportId(1));
     assert!(
         daemon
-            .engine
+            .engines
             .as_ref()
+            .unwrap()
+            .get(rel)
             .unwrap()
             .snapshot(now)
             .selected_path

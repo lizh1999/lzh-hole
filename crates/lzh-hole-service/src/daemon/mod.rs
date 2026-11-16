@@ -1,8 +1,15 @@
-//! Resident wiring: bounded physical transports, discovery, PeerEngine and utun.
+//! Resident wiring: bounded physical transports, per-relationship discovery,
+//! one `PeerSet` and one utun.
 //!
 //! Public-network operation is explicit by invoking `daemon`. utun creation and
-//! its owned peer /32 route additionally require `--allow-tun`. The offline
+//! its owned peer /32 routes additionally require `--allow-tun`. The offline
 //! control mode is a truthful control-plane-only mode, not an overlay test.
+//!
+//! A node holds one identity, one overlay address and one set of physical
+//! sockets however many peers it has. Everything else is per relationship: the
+//! engine, the coordination topic, the durable sequence stream, the anti-rollback
+//! cache, the request correlation and the candidate set. Nothing is pooled
+//! across peers, so admitting a peer cannot weaken the peers already present.
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -11,31 +18,30 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
-use lzh_hole_discovery::candidate::{CandidateSource, Endpoint};
-use lzh_hole_discovery::peer_record::{PeerRecordPolicy, PeerRecordReject};
-use lzh_hole_discovery::record::{
-    ContactRecord, MAX_LIFETIME_MS, RecordCandidate, reserve_sequence,
-};
+use lzh_hole_discovery::candidate::Endpoint;
+use lzh_hole_discovery::peer_record::PeerRecordReject;
 use lzh_hole_discovery::stun::{TRANSACTION_ID_LEN, looks_like_stun};
 use lzh_hole_discovery::{
-    CandidateScope, DiscoveryUpdate, LanAdvertisement, LanDiscovery, LanObservation, LanScope,
-    PublicDiscovery,
+    CandidateScope, DiscoveryUpdate, GatewayDnsConfig, GatewayDnsResolver, LanAdvertisement,
+    LanDiscovery, LanObservation, LanScope, NtfyConfig as NtfyTransportConfig, NtfyError,
+    NtfyEvent, NtfyHandle, NtfyOperation, NtfyPacingLoad, NtfyPacingStore, NtfyResolver,
+    NtfyTransport, PayloadError, PublicDiscovery, RequestId, SignedPayload, topic_for_relationship,
 };
 use lzh_hole_net::interface::{
     InterfaceInfo, InterfacePrefixes, enumerate_interface_prefixes, has_scoped_direct_route_from,
     interfaces_with_ipv4_route, ipv4_route_sources,
 };
 use lzh_hole_net::mdns::{MdnsClient, MdnsEvent, OperationId};
+use lzh_hole_net::overlay::OverlayRoutes;
 use lzh_hole_net::socket::RecvMeta;
 use lzh_hole_net::tun::{TunConfig, Tunnel, TunnelError};
-use lzh_hole_protocol::engine::{
-    CandidatePolicy, EngineBuildError, EngineConfig, EngineSnapshot, PeerEngine,
-};
+use lzh_hole_protocol::engine::{CandidatePolicy, EngineBuildError, EngineConfig};
 use lzh_hole_protocol::handshake::HandshakeConfig;
+use lzh_hole_protocol::mesh::{PeerSet, PeerSetError};
 use lzh_hole_protocol::path::{LanSubnet, PathCandidate, TransportPolicy};
 use lzh_hole_protocol::punch::PUNCH_BURST;
-use lzh_hole_store::{FileLock, HighWaterError, PeerRecordCache};
-use lzh_hole_types::{BootId, DiscoveryPublicKey, Secret32, TransportId};
+use lzh_hole_store::{FileLock, HighWaterError};
+use lzh_hole_types::{BootId, DiscoveryPublicKey, RelationshipId, TransportId};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at, timeout};
@@ -46,11 +52,6 @@ use lzh_hole_control::{
     ControlError, ControlResponse, ControlServer, DaemonState, DropCounters, PunchStatus,
     ServiceCommand, ServiceSnapshot,
 };
-use lzh_hole_discovery::{
-    Delivery, ExchangeAction, ExchangeTracker, MessageKind, NtfyConfig, NtfyError, NtfyEvent,
-    NtfyHandle, NtfyOperation, NtfyPacingLoad, NtfyPacingStore, NtfyTransport, PayloadError,
-    RequestId, SignedPayload, topic_for_relationship,
-};
 use lzh_hole_store::{PairingError, StateDir, read_private_bytes, write_private_bytes};
 
 const ENGINE_TICK: Duration = Duration::from_millis(250);
@@ -58,13 +59,15 @@ mod candidates;
 mod dataplane;
 mod discovery;
 mod lifecycle;
+mod peer;
 mod punch;
 mod status;
 mod transport;
 
 use candidates::{CandidateRegistry, CandidateTransport};
-use discovery::{MdnsOperation, NtfyBlock};
-use punch::{PunchBlock, PunchDatagram, PunchSockets, TokenBucket};
+use discovery::{MdnsOperation, publication_endpoints};
+use peer::{PeerNtfy, PeerRuntime};
+use punch::{PunchAttempt, PunchDatagram, PunchPeerState, PunchSockets, TokenBucket};
 use status::component;
 use transport::{TransportDatagram, TransportIds, TransportSet};
 
@@ -102,6 +105,14 @@ pub enum DaemonError {
     /// Engine construction failure.
     #[error(transparent)]
     Engine(#[from] EngineBuildError),
+    /// A relationship could not join the mesh.
+    #[error("peer set refused relationship {relationship}: {source}")]
+    PeerSet {
+        /// The relationship that was refused.
+        relationship: String,
+        /// Why it was refused.
+        source: PeerSetError,
+    },
     /// Explicitly requested utun setup failure.
     #[error(transparent)]
     Tunnel(#[from] TunnelError),
@@ -199,11 +210,27 @@ async fn run_async(
     let control = ControlServer::bind(&control_config, command_tx)?;
     let mut daemon = Daemon::new(resolved, allow_tun, components, snapshots)?;
 
+    // One actor for one host, serving every relationship's topic. Serving eight
+    // relationships with eight actors would multiply the per-host operation
+    // interval and the rolling daily budget by eight against the same host.
     let (ntfy_events, ntfy_handle, ntfy_task) = if components.network {
-        let mut ntfy = NtfyConfig::new(
-            &daemon.resolved.config.ntfy.base_url,
-            &daemon.resolved.config.ntfy.topic,
-        )?;
+        let topics = daemon
+            .peers
+            .keys()
+            .map(|id| (*id, topic_for_relationship(id)))
+            .collect::<BTreeMap<_, _>>();
+        let mut ntfy = NtfyTransportConfig::multi(&daemon.resolved.config.ntfy.base_url, &topics)?;
+        // The ntfy hostname is resolved over a socket pinned to the selected
+        // physical interface, against that interface own default gateway. A
+        // host resolver that hands out Fake-IP addresses therefore cannot
+        // decide where a coordination operation goes.
+        ntfy = ntfy.with_resolver(NtfyResolver::new(GatewayDnsResolver::new(
+            GatewayDnsConfig {
+                interface: daemon.resolved.config.interface.clone(),
+                bind_ip: daemon.resolved.config.bind_ip,
+                server: daemon.resolved.config.ntfy.dns_server,
+            },
+        )));
         if let Some(ip) = daemon.resolved.config.ntfy.resolve_ip {
             ntfy = ntfy.with_resolve_ip(ip)?;
         }
@@ -268,42 +295,55 @@ struct Daemon {
     state: StateDir,
     signing_key: SigningKey,
     _publisher_lock: FileLock,
-    peer_cache: PeerRecordCache,
-    exchange: ExchangeTracker,
     network_enabled: bool,
     transports: TransportSet,
     /// One identifier space for the data plane and the punch pool alike.
     transport_ids: TransportIds,
+
+    /// Every pinned peer, in relationship-id order. Fixed for the process
+    /// lifetime: a peer is admitted by configuration and pairing, not at runtime.
+    peers: BTreeMap<RelationshipId, PeerRuntime>,
+    /// The same ids as a stable vector, so event-loop polling never has to
+    /// allocate an order on every wakeup.
+    peer_order: Vec<RelationshipId>,
+    /// One independently authenticated engine per relationship.
+    engines: Option<PeerSet>,
+
+    /// Node-level STUN state, shared by every relationship.
+    public: PublicDiscovery,
+    /// Bonjour, pinned to every peer key at once.
+    lan: LanDiscovery,
+    /// Discovery hints, attributed to the relationship that produced them.
+    registry: CandidateRegistry,
+    /// Projected paths per relationship.
+    paths: BTreeMap<RelationshipId, Vec<PathCandidate>>,
+
     punch_sockets: PunchSockets,
     punch_bucket: TokenBucket,
-    punch_block: Option<PunchBlock>,
-    punch_failure: Option<String>,
-    punch_started_ms: Option<u64>,
-    punch_hit_port: Option<u16>,
-    punch_backoff_ms: u64,
-    next_punch_attempt_ms: u64,
-    /// The socket the punch role decision was based on, pinned for the whole
-    /// attempt so the scan cannot drift onto a differently-behaving socket.
-    punch_origin_transport: Option<TransportId>,
-    /// A punch slot whose socket already joined the data plane. Its
-    /// confirmations are still addressed to it.
-    promoted_slot: Option<(u16, TransportId)>,
-    /// Promoted sockets get a bounded handshake grace period, then must own a path.
-    promoted_transports: BTreeMap<TransportId, u64>,
+    /// At most one hole-punch attempt runs at a time across the whole mesh.
+    ///
+    /// Punch sockets are a node-level descriptor budget, and a scan is only
+    /// meaningful against one peer's NAT at a time. Peers that also want a punch
+    /// wait their turn; `peer_punch_status` reports that wait truthfully rather
+    /// than claiming an attempt is running.
+    punch: Option<PunchAttempt>,
+    /// Per-relationship punch backoff, last failure and current queue reason.
+    ///
+    /// Isolated per relationship so a peer that keeps failing never delays
+    /// another peer's attempt, and so a relationship's bookkeeping disappears
+    /// with the relationship itself.
+    punch_states: BTreeMap<RelationshipId, PunchPeerState>,
     punch_send_failures: u32,
-    /// Coordination flags from the peer's last accepted contact record.
-    peer_record_flags: u8,
-    peer_record_expires_ms: u64,
+    /// A punch slot whose socket already joined the data plane.
+    promoted_slot: Option<(RelationshipId, u16, TransportId)>,
+    /// Promoted sockets get a bounded handshake grace period, then must own a path.
+    promoted_transports: BTreeMap<TransportId, (RelationshipId, u64)>,
+
     interface_failures: BTreeMap<String, u64>,
-    engine: Option<PeerEngine>,
-    registry: CandidateRegistry,
-    paths: Vec<PathCandidate>,
     topology: Vec<InterfacePrefixes>,
     lan_scopes: BTreeMap<u32, LanScope>,
     next_scope_generation: u64,
     clock: Instant,
-    public: PublicDiscovery,
-    lan: LanDiscovery,
     mdns: Option<MdnsClient>,
     mdns_operations: BTreeMap<OperationId, MdnsOperation>,
     next_mdns_retry: Instant,
@@ -311,19 +351,17 @@ struct Daemon {
     stun_status: ComponentStatus,
     boot_id: BootId,
     generation: u64,
-    tunnel: Option<Tunnel>,
+    /// One utun plus one owned /32 per peer. Absent unless `--allow-tun`.
+    overlay: Option<OverlayRoutes>,
     tun_status: ComponentStatus,
     route_status: ComponentStatus,
-    ntfy_status: ComponentStatus,
+    /// One ntfy actor for the whole node.
     ntfy_events: Option<mpsc::Receiver<NtfyEvent>>,
     ntfy_handle: Option<NtfyHandle>,
     ntfy_task: Option<JoinHandle<Result<(), NtfyError>>>,
-    ntfy_subscribed: bool,
-    ntfy_block: Option<NtfyBlock>,
     next_interface_check: Instant,
     bytes: ByteCounters,
     io_drops: DropCounters,
-    last_healthy_unix_ms: Option<u64>,
     snapshot: ServiceSnapshot,
     snapshot_tx: watch::Sender<ServiceSnapshot>,
 }
@@ -336,59 +374,127 @@ impl Daemon {
         snapshot_tx: watch::Sender<ServiceSnapshot>,
     ) -> Result<Self, DaemonError> {
         let network_enabled = components.network;
-        let expected_topic = topic_for_relationship(&resolved.relationship.relationship_id);
-        if resolved.config.ntfy.topic != expected_topic {
-            return Err(DaemonError::State(format!(
-                "ntfy.topic must be {expected_topic} for this finalized relationship"
-            )));
-        }
         let state = StateDir::open(&resolved.config.state_dir)?;
         let signing_key = state.load_signing_key()?;
         let actual_key = DiscoveryPublicKey::from_bytes(signing_key.verifying_key().to_bytes());
-        if actual_key != resolved.relationship.self_public_key {
-            return Err(DaemonError::State(
-                "identity seed does not match the finalized relationship".to_owned(),
-            ));
+        for peer in &resolved.peers {
+            if peer.relationship.self_public_key != actual_key {
+                return Err(DaemonError::State(format!(
+                    "identity seed does not match finalized relationship {}",
+                    peer.relationship_id().to_hex()
+                )));
+            }
         }
-        let psk = state.load_psk()?;
         let publisher_lock = state.lock_publisher()?;
-        let peer_cache = PeerRecordCache::load(&state.file("peer-record.json"))?;
         let boot_id = BootId::random().map_err(|error| DaemonError::State(error.to_string()))?;
         let generation = 1;
-        let engine = if network_enabled {
-            Some(lifecycle::make_engine(
-                &resolved, &psk, boot_id, generation,
-            )?)
+
+        // Every overlay address in the mesh is never a physical candidate
+        // target, for this node's engines and for every peer's record.
+        let forbidden_addresses = std::iter::once(resolved.self_vip)
+            .chain(resolved.peers.iter().map(|peer| peer.peer_vip))
+            .collect::<Vec<_>>();
+        let stun_servers = resolved
+            .config
+            .stun_seeds
+            .iter()
+            .map(|server| endpoint(*server))
+            .collect::<Vec<_>>();
+
+        let mut engines = if network_enabled {
+            let mut set = PeerSet::new(resolved.self_vip, actual_key);
+            for peer in &resolved.peers {
+                let psk = state.load_psk(peer.relationship_id())?;
+                let config = EngineConfig {
+                    handshake: HandshakeConfig {
+                        relationship_id: peer.relationship_id(),
+                        me: actual_key,
+                        peer: peer.peer_key(),
+                        boot_id,
+                        generation,
+                    },
+                    self_vip: resolved.self_vip,
+                    peer_vip: peer.peer_vip,
+                    candidate_policy: CandidatePolicy {
+                        own_endpoints: Vec::new(),
+                        forbidden_addresses: forbidden_addresses.clone(),
+                        stun_servers: stun_servers.clone(),
+                        require_public_unicast: true,
+                    },
+                };
+                set.insert(config, &psk)
+                    .map_err(|source| DaemonError::PeerSet {
+                        relationship: peer.relationship_id().to_hex(),
+                        source,
+                    })?;
+            }
+            Some(set)
         } else {
             None
         };
-        let lan = LanDiscovery::new(resolved.relationship.peer_public_key);
+        let _ = &mut engines;
 
-        let (tunnel, tun_status, route_status) = if allow_tun {
-            let tunnel = Tunnel::create(
-                TunConfig::new(resolved.self_vip, resolved.peer_vip).with_mtu(resolved.config.mtu),
+        let ntfy_detail = if network_enabled {
+            "one actor created for every relationship topic; not subscribed yet"
+        } else {
+            "disabled by test-only component injection"
+        };
+        let mut peers = BTreeMap::new();
+        for peer in &resolved.peers {
+            let ntfy = if network_enabled {
+                PeerNtfy::starting(ntfy_detail)
+            } else {
+                PeerNtfy::not_configured(ntfy_detail)
+            };
+            let runtime = PeerRuntime::new(&state, peer.relationship.clone(), peer.peer_vip, ntfy)?;
+            peers.insert(peer.relationship_id(), runtime);
+        }
+        let peer_order = peers.keys().copied().collect::<Vec<_>>();
+
+        let lan = LanDiscovery::new(
+            resolved
+                .peers
+                .iter()
+                .map(|peer| (peer.peer_key(), peer.relationship_id()))
+                .collect(),
+        );
+
+        let (overlay, tun_status, route_status) = if allow_tun {
+            let routes = resolved
+                .peers
+                .iter()
+                .map(|peer| peer.peer_vip)
+                .collect::<Vec<_>>();
+            let overlay = OverlayRoutes::create(
+                TunConfig::new(resolved.self_vip).with_mtu(resolved.config.mtu),
+                &routes,
             )?;
             let tun_status = ComponentStatus {
                 state: ComponentState::Healthy,
                 detail: Some(format!(
                     "actual {} if_index={} mtu={}",
-                    tunnel.name(),
-                    tunnel.if_index(),
+                    overlay.tunnel().name(),
+                    overlay.tunnel().if_index(),
                     resolved.config.mtu
                 )),
                 last_success_unix_ms: Some(now_unix_ms()),
                 last_change_unix_ms: Some(now_unix_ms()),
             };
-            let (peer_route, prefix_len) = resolved.peer_host_route();
             let route_status = ComponentStatus {
                 state: ComponentState::Healthy,
                 detail: Some(format!(
-                    "Tunnel owns only peer {peer_route}/{prefix_len}; no additional route installed"
+                    "tunnel owns exactly {} peer /32 routes and nothing else: {}",
+                    routes.len(),
+                    routes
+                        .iter()
+                        .map(|peer| format!("{peer}/32"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )),
                 last_success_unix_ms: Some(now_unix_ms()),
                 last_change_unix_ms: Some(now_unix_ms()),
             };
-            (Some(tunnel), tun_status, route_status)
+            (Some(overlay), tun_status, route_status)
         } else {
             let detail = if !network_enabled {
                 "disabled by test-only component injection".to_owned()
@@ -409,59 +515,46 @@ impl Daemon {
                 },
             )
         };
-        let ntfy_status = if !network_enabled {
-            ComponentStatus {
-                state: ComponentState::NotConfigured,
-                detail: Some("disabled by test-only component injection".to_owned()),
-                ..ComponentStatus::default()
-            }
-        } else {
-            ComponentStatus {
-                state: ComponentState::Starting,
-                detail: Some("ntfy transport created; not subscribed yet".to_owned()),
-                ..ComponentStatus::default()
-            }
-        };
+
         let mut snapshot = snapshot_tx.borrow().clone();
-        snapshot.ntfy = ntfy_status.clone();
         snapshot.tun = tun_status.clone();
         snapshot.routes = route_status.clone();
         snapshot_tx.send_replace(snapshot.clone());
         let now = Instant::now();
+        // One punch bookkeeping entry per configured peer, created up front so
+        // status reporting never has to distinguish "no attempt yet" from
+        // "this relationship is unknown".
+        let punch_states: BTreeMap<RelationshipId, PunchPeerState> = peer_order
+            .iter()
+            .map(|id| (*id, PunchPeerState::default()))
+            .collect();
         let mut daemon = Self {
             resolved,
             state,
             signing_key,
             _publisher_lock: publisher_lock,
-            peer_cache,
-            exchange: ExchangeTracker::default(),
             network_enabled,
             transports: TransportSet::default(),
             transport_ids: TransportIds::default(),
+            peers,
+            peer_order,
+            engines,
+            public: PublicDiscovery::new(),
+            lan,
+            registry: CandidateRegistry::default(),
+            paths: BTreeMap::new(),
             punch_sockets: PunchSockets::default(),
             punch_bucket: TokenBucket::new(PUNCH_BURST, PUNCH_BURST, 0),
-            punch_block: None,
-            punch_failure: None,
-            punch_started_ms: None,
-            punch_hit_port: None,
-            punch_backoff_ms: punch::PUNCH_RETRY_MIN_MS,
-            next_punch_attempt_ms: 0,
-            punch_origin_transport: None,
+            punch: None,
+            punch_states,
+            punch_send_failures: 0,
             promoted_slot: None,
             promoted_transports: BTreeMap::new(),
-            punch_send_failures: 0,
-            peer_record_flags: 0,
-            peer_record_expires_ms: 0,
             interface_failures: BTreeMap::new(),
-            engine,
-            registry: CandidateRegistry::default(),
-            paths: Vec::new(),
             topology: Vec::new(),
             lan_scopes: BTreeMap::new(),
             next_scope_generation: 1,
             clock: now,
-            public: PublicDiscovery::new(),
-            lan,
             mdns: None,
             mdns_operations: BTreeMap::new(),
             next_mdns_retry: now,
@@ -469,19 +562,15 @@ impl Daemon {
             stun_status: component(ComponentState::Starting, "no public mapping measured", None),
             boot_id,
             generation,
-            tunnel,
+            overlay,
             tun_status,
             route_status,
-            ntfy_status,
             ntfy_events: None,
             ntfy_handle: None,
             ntfy_task: None,
-            ntfy_subscribed: false,
-            ntfy_block: None,
             next_interface_check: now + INTERFACE_CHECK_INTERVAL,
             bytes: ByteCounters::default(),
             io_drops: DropCounters::default(),
-            last_healthy_unix_ms: None,
             snapshot,
             snapshot_tx,
         };
@@ -495,6 +584,51 @@ impl Daemon {
             );
         }
         Ok(daemon)
+    }
+
+    /// The utun carrying every owned peer route, if one was created.
+    fn tunnel(&self) -> Option<&Tunnel> {
+        self.overlay.as_ref().map(OverlayRoutes::tunnel)
+    }
+
+    /// Every overlay address in the mesh: ours and every peer's.
+    ///
+    /// No engine and no peer record may ever name one of these as a physical
+    /// candidate target, whichever relationship it belongs to.
+    fn forbidden_addresses(&self) -> Vec<Ipv4Addr> {
+        std::iter::once(self.resolved.self_vip)
+            .chain(self.peers.values().map(|peer| peer.peer_vip))
+            .collect()
+    }
+
+    /// The parts of `NodeFacts` that must be computed before any peer is
+    /// borrowed mutably.
+    ///
+    /// `NodeFacts` itself is assembled at each call site from individual field
+    /// references rather than through a `&self` method, because a method would
+    /// borrow the whole daemon and make `self.peers.get_mut(..)` illegal in the
+    /// same scope. Field-level borrows of `state`, `signing_key`, `public`,
+    /// `transports` and `ntfy_handle` are disjoint from `peers`.
+    fn node_fact_parts(&self) -> (Vec<Endpoint>, Vec<Ipv4Addr>) {
+        (
+            self.resolved
+                .config
+                .stun_seeds
+                .iter()
+                .map(|server| endpoint(*server))
+                .collect(),
+            self.forbidden_addresses(),
+        )
+    }
+
+    fn self_key(&self) -> DiscoveryPublicKey {
+        self.resolved
+            .peers
+            .first()
+            .map(|peer| peer.relationship.self_public_key)
+            .unwrap_or_else(|| {
+                DiscoveryPublicKey::from_bytes(self.signing_key.verifying_key().to_bytes())
+            })
     }
 
     async fn event_loop(
@@ -519,7 +653,10 @@ impl Daemon {
                 udp = self.transports.recv() => LoopEvent::Udp(udp),
                 punch = self.punch_sockets.recv() => LoopEvent::Punch(punch),
                 mdns = next_mdns(&mut self.mdns) => LoopEvent::Mdns(mdns),
-                tun = recv_tun(self.tunnel.as_ref(), self.resolved.config.mtu) => LoopEvent::Tun(tun),
+                tun = recv_tun(
+                    self.overlay.as_ref().map(OverlayRoutes::tunnel),
+                    self.resolved.config.mtu,
+                ) => LoopEvent::Tun(tun),
                 _ = tokio::signal::ctrl_c() => LoopEvent::Stop,
                 _ = sigterm.recv() => LoopEvent::Stop,
                 changed = shutdown.changed() => {
@@ -531,15 +668,7 @@ impl Daemon {
                 LoopEvent::Stop => return Ok(()),
                 LoopEvent::Command(None) => return Ok(()),
                 LoopEvent::Command(Some(command)) => self.handle_command(command).await,
-                LoopEvent::Ntfy(None) => {
-                    self.ntfy_events = None;
-                    self.ntfy_subscribed = false;
-                    self.ntfy_status = component(
-                        ComponentState::Failed,
-                        "ntfy actor stopped; UDP continues and the operation budget is not reset",
-                        None,
-                    );
-                }
+                LoopEvent::Ntfy(None) => self.handle_ntfy_closed(),
                 LoopEvent::Ntfy(Some(event)) => self.handle_ntfy(event).await,
                 LoopEvent::Udp(udp) => self.handle_udp(udp).await,
                 LoopEvent::Punch(punch) => {
@@ -557,32 +686,44 @@ impl Daemon {
 
     async fn housekeeping(&mut self) {
         let now_ms = now_unix_ms();
-        if let Some(engine) = &mut self.engine {
-            engine.tick(now_ms);
+        if let Some(engines) = &mut self.engines {
+            engines.tick(now_ms);
         }
         // A punch never starts while a path is healthy; `maybe_start_punch`
         // enforces that and records why it declined.
         self.maybe_start_punch(now_ms);
         self.drive_punch(now_ms);
         let now = self.monotonic_ms();
-        let expired = self.public.expire(now);
-        if let Some(id) = expired.expired_request {
-            self.exchange.cancel_request(id);
+        self.public.expire_sockets(now);
+        let mut updates = Vec::new();
+        for (relationship, peer) in &mut self.peers {
+            let expiry = peer.public.expire(now);
+            if let Some(id) = expiry.expired_request {
+                peer.exchange.cancel_request(id);
+            }
+            updates.extend(
+                expiry
+                    .updates
+                    .into_iter()
+                    .map(|update| (*relationship, update)),
+            );
         }
-        let mut updates = expired.updates;
-        updates.extend(self.lan.expire(now));
-        if !updates.is_empty() {
-            self.apply_discovery_updates(updates);
-        }
+        updates.extend(
+            self.lan
+                .expire(now)
+                .into_iter()
+                .map(|update| (update.relationship_id, update.update)),
+        );
+        self.apply_tagged_updates(updates);
         self.registry.expire(now);
-        self.refresh_public_request();
+        self.refresh_public_requests();
         if self.network_enabled && Instant::now() >= self.next_interface_check {
             self.next_interface_check = Instant::now() + INTERFACE_CHECK_INTERVAL;
             self.refresh_network();
         }
         self.ensure_mdns();
         self.maybe_start_stun().await;
-        self.maybe_queue_request();
+        self.maybe_queue_requests();
     }
 
     async fn handle_command(&mut self, command: ServiceCommand) {

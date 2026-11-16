@@ -1,7 +1,7 @@
 //! Explicit, non-secret service configuration.
 //!
 //! Virtual addresses and peer identity deliberately do not appear in the TOML
-//! schema. They are loaded from the finalized pairing relationship so a second
+//! schema. They are loaded from the finalized pairing relationships so a second
 //! configuration source cannot disagree with the authenticated pairing state.
 
 use std::fs::OpenOptions;
@@ -12,9 +12,11 @@ use std::path::{Path, PathBuf};
 
 use lzh_hole_discovery::candidate::{self, EndpointReject};
 use lzh_hole_net::interface::is_tunnel_name;
+use lzh_hole_protocol::mesh::MAX_PEERS;
 use serde::{Deserialize, Serialize};
 
 use lzh_hole_store::{PAIRING_VERSION, PairingError, Relationship, StateDir};
+use lzh_hole_types::{DiscoveryPublicKey, RelationshipId};
 
 /// Conservative tunnel MTU. Larger values are refused by the service schema.
 pub const DEFAULT_MTU: u16 = 1200;
@@ -29,8 +31,6 @@ pub const MAX_CONTROL_SOCKET_PATH_BYTES: usize = 103;
 
 const MAX_STUN_SEEDS: usize = 8;
 const MAX_NTFY_BASE_URL_LEN: usize = 2048;
-const MIN_NTFY_TOPIC_LEN: usize = 16;
-const MAX_NTFY_TOPIC_LEN: usize = 128;
 
 fn default_mtu() -> u16 {
     DEFAULT_MTU
@@ -55,17 +55,28 @@ impl Default for LanConfig {
     }
 }
 
-/// ntfy coordination settings. The topic is not an authentication secret.
+/// ntfy coordination settings.
+///
+/// There is deliberately no topic here. Every topic is exactly
+/// `lzh-hole-v1-<relationship id hex>`, derived from the finalised pairing
+/// state, so an operator cannot point one relationship's coordination at
+/// another's topic and a hand-copied example value cannot start the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NtfyConfig {
     /// HTTPS origin and optional path prefix, without query or fragment.
     pub base_url: String,
-    /// A long, unguessable topic containing only ASCII alphanumerics, '_' and '-'.
-    pub topic: String,
     /// Optional public IPv4 resolve override that preserves the HTTPS hostname.
     #[serde(default)]
     pub resolve_ip: Option<Ipv4Addr>,
+    /// Optional resolver for the ntfy hostname.
+    ///
+    /// The hostname is never looked up through the host resolver. By default
+    /// it is asked of the selected physical interface own IPv4 default
+    /// gateway, over a socket pinned to that interface; this field only
+    /// overrides which server is asked.
+    #[serde(default)]
+    pub dns_server: Option<SocketAddrV4>,
 }
 
 /// Largest permitted punch transmission rate.
@@ -144,23 +155,62 @@ pub struct ServiceConfig {
     pub punch: PunchConfig,
 }
 
-/// Configuration joined with the one authoritative pairing relationship.
+/// One pinned peer resolved from its finalised pairing relationship.
 #[derive(Debug, Clone)]
-pub struct ResolvedConfig {
-    /// Non-secret service settings.
-    pub config: ServiceConfig,
+pub struct ResolvedPeer {
     /// Authenticated public pairing metadata, without the relationship PSK.
     pub relationship: Relationship,
-    /// Parsed local /32 virtual address from `relationship.self_vip`.
-    pub self_vip: Ipv4Addr,
     /// Parsed peer /32 virtual address from `relationship.peer_vip`.
     pub peer_vip: Ipv4Addr,
 }
 
-impl ResolvedConfig {
-    /// The only peer route the later tunnel integration may request.
-    pub fn peer_host_route(&self) -> (Ipv4Addr, u8) {
+impl ResolvedPeer {
+    /// The relationship this peer belongs to.
+    pub fn relationship_id(&self) -> RelationshipId {
+        self.relationship.relationship_id
+    }
+
+    /// The pinned peer discovery key.
+    pub fn peer_key(&self) -> DiscoveryPublicKey {
+        self.relationship.peer_public_key
+    }
+
+    /// The one host route this peer may contribute.
+    pub fn host_route(&self) -> (Ipv4Addr, u8) {
         (self.peer_vip, HOST_ROUTE_PREFIX_LEN)
+    }
+}
+
+/// Configuration joined with every finalised pairing relationship.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    /// Non-secret service settings.
+    pub config: ServiceConfig,
+    /// Parsed local /32 virtual address, identical in every relationship.
+    pub self_vip: Ipv4Addr,
+    /// Every pinned peer, in relationship-id order.
+    pub peers: Vec<ResolvedPeer>,
+}
+
+impl ResolvedConfig {
+    /// Every host route the tunnel integration may request, one per peer.
+    ///
+    /// Overlay routing stays host-only: exactly one /32 per pinned peer, never
+    /// a prefix, never a default route.
+    pub fn peer_host_routes(&self) -> impl Iterator<Item = (Ipv4Addr, u8)> + '_ {
+        self.peers.iter().map(ResolvedPeer::host_route)
+    }
+
+    /// One peer by relationship.
+    pub fn peer(&self, relationship: RelationshipId) -> Option<&ResolvedPeer> {
+        self.peers
+            .iter()
+            .find(|peer| peer.relationship_id() == relationship)
+    }
+
+    /// Every pinned peer discovery key, for Bonjour pinning.
+    pub fn peer_keys(&self) -> impl Iterator<Item = DiscoveryPublicKey> + '_ {
+        self.peers.iter().map(ResolvedPeer::peer_key)
     }
 }
 
@@ -318,6 +368,31 @@ fn validate_ntfy(config: &NtfyConfig) -> Result<(), ConfigError> {
             "ntfy.base_url contains refused numeric address {ip}"
         )));
     }
+    if let Some(server) = config.dns_server {
+        if server.port() == 0 {
+            return Err(invalid("ntfy.dns_server port must be non-zero"));
+        }
+        // A resolver is normally the LAN gateway, so private space is allowed.
+        // Anything that cannot answer a unicast query is not.
+        if matches!(
+            candidate::classify(*server.ip()),
+            Some(
+                EndpointReject::ThisNetwork
+                    | EndpointReject::Multicast
+                    | EndpointReject::Reserved
+                    | EndpointReject::Broadcast
+                    | EndpointReject::FakeIp
+                    | EndpointReject::IetfProtocol
+                    | EndpointReject::Documentation
+                    | EndpointReject::Shared6to4
+            )
+        ) {
+            return Err(invalid(format!(
+                "ntfy.dns_server {} is not a usable resolver address",
+                server.ip()
+            )));
+        }
+    }
     if let Some(ip) = config.resolve_ip {
         if candidate::classify(ip).is_some() {
             return Err(invalid(format!(
@@ -331,17 +406,6 @@ fn validate_ntfy(config: &NtfyConfig) -> Result<(), ConfigError> {
         }
     }
 
-    let topic_len = config.topic.len();
-    if !(MIN_NTFY_TOPIC_LEN..=MAX_NTFY_TOPIC_LEN).contains(&topic_len)
-        || !config
-            .topic
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        return Err(invalid(format!(
-            "ntfy.topic must be {MIN_NTFY_TOPIC_LEN}..={MAX_NTFY_TOPIC_LEN} ASCII alphanumerics, '_' or '-'"
-        )));
-    }
     Ok(())
 }
 
@@ -471,44 +535,102 @@ impl ServiceConfig {
         validate_ntfy(&self.ntfy)
     }
 
-    /// Join with finalized pairing metadata and validate strict host VIPs.
-    pub fn resolve(self, relationship: Relationship) -> Result<ResolvedConfig, ConfigError> {
+    /// Join with every finalized pairing relationship and validate strict host VIPs.
+    ///
+    /// A node has exactly one discovery identity and one overlay address however
+    /// many peers it has, so every relationship must agree on both. Peer
+    /// addresses and peer keys must each be claimed by exactly one relationship,
+    /// and no peer address may be ours.
+    pub fn resolve(self, relationships: Vec<Relationship>) -> Result<ResolvedConfig, ConfigError> {
         self.validate()?;
-        if relationship.pairing_version != PAIRING_VERSION {
-            return Err(invalid(format!(
-                "unsupported pairing version {}",
-                relationship.pairing_version
-            )));
-        }
-        if relationship.self_public_key == relationship.peer_public_key {
-            return Err(invalid("paired self and peer identities must differ"));
-        }
-        let self_vip = parse_paired_vip("self_vip", &relationship.self_vip)?;
-        let peer_vip = parse_paired_vip("peer_vip", &relationship.peer_vip)?;
-        if self_vip == peer_vip {
-            return Err(invalid("paired self_vip and peer_vip must differ"));
-        }
-        if let Some(bind_ip) = self.bind_ip
-            && (bind_ip == self_vip || bind_ip == peer_vip)
-        {
+        if relationships.is_empty() {
             return Err(invalid(
-                "physical bind_ip must not collide with either overlay VIP",
+                "no finalized relationship in the state directory; run pair offer/accept/finalize first",
             ));
         }
+        if relationships.len() > MAX_PEERS {
+            return Err(invalid(format!(
+                "{} finalized relationships exceed the {MAX_PEERS}-peer bound",
+                relationships.len()
+            )));
+        }
+        let mut peers: Vec<ResolvedPeer> = Vec::with_capacity(relationships.len());
+        let mut self_vip: Option<Ipv4Addr> = None;
+        let mut self_key: Option<DiscoveryPublicKey> = None;
+
+        for relationship in relationships {
+            if relationship.pairing_version != PAIRING_VERSION {
+                return Err(invalid(format!(
+                    "unsupported pairing version {}",
+                    relationship.pairing_version
+                )));
+            }
+            if relationship.self_public_key == relationship.peer_public_key {
+                return Err(invalid("paired self and peer identities must differ"));
+            }
+            let local = parse_paired_vip("self_vip", &relationship.self_vip)?;
+            let peer_vip = parse_paired_vip("peer_vip", &relationship.peer_vip)?;
+            if local == peer_vip {
+                return Err(invalid("paired self_vip and peer_vip must differ"));
+            }
+            if let Some(existing) = self_vip
+                && existing != local
+            {
+                return Err(invalid(format!(
+                    "relationship {} declares local overlay address {local}, but another relationship declares {existing}",
+                    relationship.relationship_id.to_hex()
+                )));
+            }
+            self_vip = Some(local);
+            if let Some(existing) = self_key
+                && existing != relationship.self_public_key
+            {
+                return Err(invalid(
+                    "every relationship must pin the same local discovery identity",
+                ));
+            }
+            self_key = Some(relationship.self_public_key);
+            if peers.iter().any(|peer| peer.peer_vip == peer_vip) {
+                return Err(invalid(format!(
+                    "peer overlay address {peer_vip} is claimed by more than one relationship"
+                )));
+            }
+            if peers
+                .iter()
+                .any(|peer| peer.peer_key() == relationship.peer_public_key)
+            {
+                return Err(invalid(
+                    "one peer discovery key is pinned by more than one relationship",
+                ));
+            }
+            peers.push(ResolvedPeer {
+                relationship,
+                peer_vip,
+            });
+        }
+
+        let self_vip = self_vip.expect("at least one relationship was resolved");
+        if let Some(bind_ip) = self.bind_ip
+            && (bind_ip == self_vip || peers.iter().any(|peer| peer.peer_vip == bind_ip))
+        {
+            return Err(invalid(
+                "physical bind_ip must not collide with any overlay VIP",
+            ));
+        }
+        peers.sort_unstable_by_key(ResolvedPeer::relationship_id);
         Ok(ResolvedConfig {
             config: self,
-            relationship,
             self_vip,
-            peer_vip,
+            peers,
         })
     }
 
-    /// Load this file and the finalized relationship from its configured state directory.
+    /// Load this file and every finalized relationship from its configured state directory.
     pub fn load_resolved(path: &Path) -> Result<ResolvedConfig, ConfigError> {
         let config = Self::load(path)?;
         let state = StateDir::open(&config.state_dir)?;
-        let relationship = state.load_relationship()?;
-        config.resolve(relationship)
+        let relationships = state.load_relationships()?;
+        config.resolve(relationships)
     }
 }
 
@@ -544,29 +666,37 @@ mtu = 1200
 
 [ntfy]
 base_url = "https://ntfy.sh"
-topic = "lzh-example-0123456789abcdef"
 "#;
 
     fn valid_config() -> ServiceConfig {
         ServiceConfig::from_toml(VALID_TOML).unwrap()
     }
 
-    fn relationship() -> Relationship {
+    /// One relationship of the local node `self_key` / `self_vip`.
+    fn peer_relationship(id: u8, peer_key: u8, self_vip: &str, peer_vip: &str) -> Relationship {
         Relationship {
             pairing_version: PAIRING_VERSION,
-            pairing_id: RelationshipId::from_bytes([1; 16]),
-            relationship_id: RelationshipId::from_bytes([2; 16]),
+            pairing_id: RelationshipId::from_bytes([id; 16]),
+            relationship_id: RelationshipId::from_bytes([id; 16]),
             self_public_key: DiscoveryPublicKey::from_bytes([3; 32]),
-            peer_public_key: DiscoveryPublicKey::from_bytes([4; 32]),
+            peer_public_key: DiscoveryPublicKey::from_bytes([peer_key; 32]),
             role: Role::Initiator,
-            self_vip: "10.203.0.1".to_owned(),
-            peer_vip: "10.203.0.2".to_owned(),
+            self_vip: self_vip.to_owned(),
+            peer_vip: peer_vip.to_owned(),
             finalised_unix_ms: 1,
         }
     }
 
+    fn relationship() -> Relationship {
+        peer_relationship(2, 4, "10.203.0.1", "10.203.0.2")
+    }
+
+    fn resolve(relationships: Vec<Relationship>) -> Result<ResolvedConfig, ConfigError> {
+        valid_config().resolve(relationships)
+    }
+
     #[test]
-    fn explicit_config_has_no_vip_or_secret_fields() {
+    fn explicit_config_has_no_vip_topic_or_secret_fields() {
         let config = valid_config();
         assert_eq!(config.mtu, DEFAULT_MTU);
         assert!(
@@ -585,6 +715,14 @@ topic = "lzh-example-0123456789abcdef"
             "management_uid = 501\nself_vip = \"10.0.0.9\"",
         );
         assert!(ServiceConfig::from_toml(&with_vip).is_err());
+        // The ntfy topic is derived from the relationship, so a hand-written one
+        // is an unknown field rather than something an operator can point at
+        // another relationship's coordination stream.
+        let with_topic = VALID_TOML.replace(
+            "base_url = \"https://ntfy.sh\"",
+            "base_url = \"https://ntfy.sh\"\ntopic = \"lzh-example-0123456789abcdef\"",
+        );
+        assert!(ServiceConfig::from_toml(&with_topic).is_err());
     }
 
     #[test]
@@ -616,18 +754,138 @@ topic = "lzh-example-0123456789abcdef"
         for vip in ["198.18.0.1", "8.8.8.8", "10.203.0.0/24"] {
             let mut relationship = relationship();
             relationship.peer_vip = vip.to_owned();
-            assert!(valid_config().resolve(relationship).is_err(), "VIP {vip}");
+            assert!(resolve(vec![relationship]).is_err(), "VIP {vip}");
         }
     }
 
     #[test]
     fn resolved_addresses_come_only_from_pairing_and_are_host_routes() {
-        let resolved = valid_config().resolve(relationship()).unwrap();
+        let resolved = resolve(vec![relationship()]).unwrap();
         assert_eq!(resolved.self_vip, Ipv4Addr::new(10, 203, 0, 1));
         assert_eq!(
-            resolved.peer_host_route(),
-            (Ipv4Addr::new(10, 203, 0, 2), 32)
+            resolved.peer_host_routes().collect::<Vec<_>>(),
+            vec![(Ipv4Addr::new(10, 203, 0, 2), 32)]
         );
+    }
+
+    #[test]
+    fn a_three_node_mesh_resolves_one_self_address_and_one_route_per_peer() {
+        let peers = vec![
+            peer_relationship(0x11, 4, "10.203.0.1", "10.203.0.2"),
+            peer_relationship(0x22, 5, "10.203.0.1", "10.203.0.3"),
+        ];
+        let resolved = resolve(peers.clone()).unwrap();
+
+        // One overlay address for this node however many peers it has.
+        assert_eq!(resolved.self_vip, Ipv4Addr::new(10, 203, 0, 1));
+        assert_eq!(resolved.peers.len(), 2);
+
+        // Exactly one /32 per peer, never a prefix and never a default route.
+        let routes = resolved.peer_host_routes().collect::<Vec<_>>();
+        assert_eq!(
+            routes,
+            vec![
+                (Ipv4Addr::new(10, 203, 0, 2), HOST_ROUTE_PREFIX_LEN),
+                (Ipv4Addr::new(10, 203, 0, 3), HOST_ROUTE_PREFIX_LEN),
+            ]
+        );
+        assert!(routes.iter().all(|(_, prefix)| *prefix == 32));
+
+        // Peers are addressable by relationship, and keys are enumerable for
+        // Bonjour pinning.
+        for peer in &peers {
+            let found = resolved
+                .peer(peer.relationship_id)
+                .expect("peer is resolved");
+            assert_eq!(found.peer_vip.to_string(), peer.peer_vip);
+            assert_eq!(found.peer_key(), peer.peer_public_key);
+        }
+        assert!(
+            resolved
+                .peer(RelationshipId::from_bytes([0x99; 16]))
+                .is_none()
+        );
+        assert_eq!(resolved.peer_keys().collect::<Vec<_>>().len(), 2);
+
+        // Peers are ordered by relationship id, so the resolved view is stable.
+        let ids = resolved
+            .peers
+            .iter()
+            .map(ResolvedPeer::relationship_id)
+            .collect::<Vec<_>>();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+    }
+
+    #[test]
+    fn every_relationship_must_agree_on_the_local_identity_and_address() {
+        // A different local overlay address in one relationship is refused.
+        assert!(
+            resolve(vec![
+                peer_relationship(0x11, 4, "10.203.0.1", "10.203.0.2"),
+                peer_relationship(0x22, 5, "10.203.0.9", "10.203.0.3"),
+            ])
+            .is_err()
+        );
+
+        // So is a different local discovery identity.
+        let mut other_identity = peer_relationship(0x22, 5, "10.203.0.1", "10.203.0.3");
+        other_identity.self_public_key = DiscoveryPublicKey::from_bytes([9; 32]);
+        assert!(
+            resolve(vec![
+                peer_relationship(0x11, 4, "10.203.0.1", "10.203.0.2"),
+                other_identity,
+            ])
+            .is_err()
+        );
+
+        // A node with no relationship at all is refused rather than started
+        // with an empty mesh that silently accepts no traffic.
+        assert!(resolve(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_peer_address_or_key_may_be_claimed_by_only_one_relationship() {
+        // Two relationships pointing at the same overlay address would make
+        // destination-based routing ambiguous.
+        assert!(
+            resolve(vec![
+                peer_relationship(0x11, 4, "10.203.0.1", "10.203.0.2"),
+                peer_relationship(0x22, 5, "10.203.0.1", "10.203.0.2"),
+            ])
+            .is_err()
+        );
+
+        // Two relationships pinning the same peer key would let one peer hold
+        // two independent session and replay states.
+        assert!(
+            resolve(vec![
+                peer_relationship(0x11, 4, "10.203.0.1", "10.203.0.2"),
+                peer_relationship(0x22, 4, "10.203.0.1", "10.203.0.3"),
+            ])
+            .is_err()
+        );
+
+        // A peer address equal to our own is refused.
+        assert!(resolve(vec![peer_relationship(0x11, 4, "10.203.0.1", "10.203.0.1")]).is_err());
+    }
+
+    #[test]
+    fn more_relationships_than_the_mesh_bound_are_refused() {
+        let peers = (0..=MAX_PEERS)
+            .map(|index| {
+                let id = u8::try_from(index + 1).unwrap();
+                peer_relationship(
+                    id,
+                    id.wrapping_add(0x40),
+                    "10.203.0.1",
+                    &format!("10.203.1.{id}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(peers.len(), MAX_PEERS + 1);
+        assert!(resolve(peers).is_err());
     }
 
     #[test]
@@ -640,7 +898,6 @@ topic = "lzh-example-0123456789abcdef"
             VALID_TOML.replace("/var/db/lzh-hole", "relative/state"),
             VALID_TOML.replace("https://ntfy.sh", "http://ntfy.sh"),
             VALID_TOML.replace("https://ntfy.sh", "https://user:pass@ntfy.sh"),
-            VALID_TOML.replace("lzh-example-0123456789abcdef", "short"),
         ];
         for text in cases {
             assert!(ServiceConfig::from_toml(&text).is_err(), "{text}");
@@ -675,14 +932,53 @@ topic = "lzh-example-0123456789abcdef"
     }
 
     #[test]
+    fn ntfy_dns_server_may_be_a_lan_resolver_but_not_a_refused_address() {
+        let text = VALID_TOML.replace(
+            "base_url = \"https://ntfy.sh\"",
+            "base_url = \"https://ntfy.sh\"\ndns_server = \"192.168.31.1:53\"",
+        );
+        let config = ServiceConfig::from_toml(&text).unwrap();
+        assert_eq!(
+            config.ntfy.dns_server,
+            Some(SocketAddrV4::new(Ipv4Addr::new(192, 168, 31, 1), 53))
+        );
+
+        for server in [
+            "192.168.31.1:0",
+            "198.18.0.2:53",
+            "224.0.0.1:53",
+            "255.255.255.255:53",
+            "0.0.0.0:53",
+        ] {
+            let text = VALID_TOML.replace(
+                "base_url = \"https://ntfy.sh\"",
+                &format!("base_url = \"https://ntfy.sh\"\ndns_server = \"{server}\""),
+            );
+            assert!(
+                ServiceConfig::from_toml(&text).is_err(),
+                "dns_server {server}"
+            );
+        }
+    }
+
+    #[test]
     fn physical_bind_may_be_rfc1918_but_not_a_vip() {
         let text = VALID_TOML.replace(
             "interface = \"en0\"",
             "interface = \"en0\"\nbind_ip = \"192.168.8.164\"",
         );
         let config = ServiceConfig::from_toml(&text).unwrap();
-        let mut relationship = relationship();
-        relationship.self_vip = "192.168.8.164".to_owned();
-        assert!(config.resolve(relationship).is_err());
+
+        // Colliding with our own overlay address.
+        let mut own = relationship();
+        own.self_vip = "192.168.8.164".to_owned();
+        assert!(config.clone().resolve(vec![own]).is_err());
+
+        // Colliding with any peer's overlay address, not just the first one.
+        let peers = vec![
+            peer_relationship(0x11, 4, "10.203.0.1", "10.203.0.2"),
+            peer_relationship(0x22, 5, "10.203.0.1", "192.168.8.164"),
+        ];
+        assert!(config.resolve(peers).is_err());
     }
 }

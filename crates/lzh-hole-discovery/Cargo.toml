@@ -10,6 +10,7 @@ description = "Signed ntfy discovery, candidates and STUN for lzh-hole"
 workspace = true
 
 [dependencies]
+lzh-hole-net.workspace = true
 lzh-hole-protocol.workspace = true
 lzh-hole-types.workspace = true
 bytes = "1"

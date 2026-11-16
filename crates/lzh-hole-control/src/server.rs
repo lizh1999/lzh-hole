@@ -18,7 +18,15 @@ use crate::dto::{ControlErrorCode, ControlRequest, ControlResponse, DoctorReport
 use crate::error::{ControlError, io};
 
 /// Maximum encoded request or response line, excluding the newline.
-pub const MAX_CONTROL_LINE_BYTES: usize = 16 * 1024;
+///
+/// Sized for a saturated doctor response: `MAX_PEERS_IN_SNAPSHOT` peers each
+/// carrying `MAX_CANDIDATES_PER_PEER` candidates plus full component detail.
+/// `dto::tests::a_saturated_snapshot_fits_one_control_line` pins the invariant
+/// against a deliberately adversarial snapshot (every string at its documented
+/// maximum), which measures 71022 bytes. Lowering this without lowering those
+/// bounds fails the build rather than silently degrading `doctor` into a
+/// generic internal error.
+pub const MAX_CONTROL_LINE_BYTES: usize = 128 * 1024;
 /// Maximum number of doctor operations waiting for the service owner.
 pub const COMMAND_CHANNEL_CAPACITY: usize = 16;
 /// Maximum concurrent local control connections.

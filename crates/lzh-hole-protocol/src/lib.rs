@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod engine;
 pub mod handshake;
 pub mod health;
+pub mod mesh;
 pub mod path;
 pub mod punch;
 pub mod replay;
@@ -22,6 +23,7 @@ pub use engine::{
 pub use handshake::{Handshake, HandshakeConfig, HandshakeEvent, HandshakeReject};
 pub use health::{Health, HealthState, PathContext, PendingPing, PongOutcome};
 pub use lzh_hole_types::Endpoint;
+pub use mesh::{Inbound, MAX_PEERS, MeshSendError, PeerSet, PeerSetError};
 pub use path::{
     Candidate, CandidateSource, EndpointReject, RejectedCandidate, classify, is_private,
     partition_candidates, validate_publishable, validate_remote_target,
