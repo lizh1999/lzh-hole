@@ -164,6 +164,16 @@ impl NtfyConfig {
         self.topics.get(relationship).map(String::as_str)
     }
 
+    /// Host of the base URL, for a lookup that precedes any host operation.
+    pub(crate) fn base_host(&self) -> Option<&str> {
+        self.base_url.host_str()
+    }
+
+    /// The injected resolver, when this configuration has one.
+    pub(crate) fn resolver(&self) -> Option<&NtfyResolver> {
+        self.resolver.as_ref()
+    }
+
     /// Resolve the existing HTTPS hostname to one public IPv4 without changing
     /// its SNI, certificate hostname, origin, topic or serialized host pacing.
     pub fn with_resolve_ip(mut self, ip: std::net::Ipv4Addr) -> Result<Self, NtfyError> {
@@ -256,6 +266,22 @@ impl NtfyResolver {
     /// Wrap any resolver, including the gateway DNS resolver of this crate.
     pub fn new<R: reqwest::dns::Resolve + 'static>(resolver: R) -> Self {
         Self(Arc::new(resolver))
+    }
+
+    /// Resolve one hostname once, outside any HTTP request.
+    ///
+    /// The answer is deliberately not filtered here: this only answers whether
+    /// the name can be resolved at all, and the address policy that decides
+    /// what may be connected to still belongs to the request path.
+    pub(crate) async fn resolve_once(&self, host: &str) -> Result<(), String> {
+        let name: reqwest::dns::Name = host
+            .parse()
+            .map_err(|_| format!("{host:?} is not a resolvable DNS name"))?;
+        self.0
+            .resolve(name)
+            .await
+            .map(|_| ())
+            .map_err(|error| describe_error(error.as_ref()))
     }
 }
 

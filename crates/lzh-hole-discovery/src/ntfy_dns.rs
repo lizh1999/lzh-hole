@@ -3,23 +3,41 @@
 //! The transport asks this resolver instead of the system one. A system
 //! resolver that has been pointed at a Fake-IP proxy hands out 198.18.0.0/15
 //! addresses whose reachability depends on that proxy being up, and no amount
-//! of retrying makes such an answer real. Asking the selected physical
-//! interface own default gateway, from a socket pinned to that interface,
-//! keeps the question and the answer on the same path the data plane uses.
+//! of retrying makes such an answer real. Asking a resolver from a socket
+//! pinned to the selected physical interface keeps the question and the answer
+//! on the same path the data plane uses.
+//!
+//! Which resolver is asked is a chain, not a guess. A configured server is
+//! authoritative. Otherwise each interface contributes the resolvers its own
+//! DHCP lease offers and then its own default gateway, and every server that
+//! does not answer hands over to the next one inside one bounded resolution.
+//! A gateway that does not run a resolver is an ordinary network.
 //!
 //! Nothing here decides whether an answer may be connected to. That policy
 //! lives in the transport, so it applies to every injected resolver equally.
 
+use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
-use lzh_hole_net::dns::{self, DNS_PORT, DnsError};
+use lzh_hole_net::dhcp::dhcp_dns_servers;
+use lzh_hole_net::dns::{self, DNS_PORT, DnsError, DnsOptions};
 use lzh_hole_net::interface::{
     InterfacePrefixes, Ipv4Prefix, default_gateway_ipv4, enumerate_interface_prefixes,
+    ipv4_route_sources,
 };
+use tokio::time::Instant;
 
-/// Bound on one whole resolution, including every DNS attempt.
+/// Bound on one whole resolution, including every server that is tried.
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Transmissions attempted against one server before moving on to the next.
+pub const PLAN_ATTEMPTS: usize = 2;
+/// Wait for a single transmission.
+pub const PLAN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Bound on one server, so a silent server cannot eat the whole resolution.
+pub const PLAN_TIMEOUT: Duration = Duration::from_secs(4);
+/// Most servers one interface may contribute to one resolution.
+pub const MAX_PLAN_SERVERS: usize = 4;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -54,8 +72,8 @@ pub enum ResolveError {
     /// The requested interface is unknown, or is not a usable physical one.
     #[error("{0:?} is not a usable physical IPv4 interface")]
     UnknownInterface(String),
-    /// No source address shares a link with the server that must be asked.
-    #[error("{interface} has no IPv4 source address on the same link as {server}")]
+    /// No source address on this interface has a route to the server.
+    #[error("{interface} has no IPv4 source address that can reach {server}")]
     NoSource {
         /// Interface that was chosen.
         interface: String,
@@ -93,9 +111,11 @@ impl GatewayDnsResolver {
         Self { config }
     }
 
-    /// The plan one lookup would use, without sending anything.
-    pub fn plan(&self) -> Result<QueryPlan, ResolveError> {
-        plan_query(&self.config)
+    /// Every plan one lookup may try, in the order it would try them.
+    ///
+    /// Nothing is sent: this only reads interfaces, routes and DHCP leases.
+    pub fn plans(&self) -> Result<Vec<QueryPlan>, ResolveError> {
+        plan_queries(&self.config)
     }
 }
 
@@ -118,45 +138,106 @@ async fn resolve_host(
     config: &GatewayDnsConfig,
     host: &str,
 ) -> Result<Vec<Ipv4Addr>, ResolveError> {
-    let plan = plan_query(config)?;
-    tokio::time::timeout(
-        RESOLVE_TIMEOUT,
-        dns::query_a(&plan.interface, plan.bind_ip, plan.server, host),
-    )
-    .await
-    .map_err(|_| ResolveError::Timeout)?
-    .map_err(ResolveError::Query)
-}
-
-fn plan_query(config: &GatewayDnsConfig) -> Result<QueryPlan, ResolveError> {
-    let snapshots = enumerate_interface_prefixes()?;
-    let candidates = candidate_interfaces(&snapshots, config.interface.as_deref())?;
+    let plans = plan_queries(config)?;
+    let deadline = Instant::now() + RESOLVE_TIMEOUT;
     let mut last: Option<ResolveError> = None;
-    for snapshot in candidates {
-        match plan_for(snapshot, config) {
-            Ok(plan) => return Ok(plan),
-            // An adapter with a routable address but no gateway, or whose
-            // aliases cannot reach the server, is simply not this host way
-            // out. Keep looking instead of failing the whole lookup.
-            Err(error) => last = Some(error),
+    for plan in plans {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if last.is_none() {
+                last = Some(ResolveError::Timeout);
+            }
+            break;
+        }
+        let options = DnsOptions {
+            attempts: PLAN_ATTEMPTS,
+            attempt_timeout: PLAN_ATTEMPT_TIMEOUT,
+        };
+        let query = dns::query_a_with(&plan.interface, plan.bind_ip, plan.server, host, options);
+        // A server that never answers must not consume the budget of the
+        // servers behind it, so each one is bounded on its own as well.
+        match tokio::time::timeout(remaining.min(PLAN_TIMEOUT), query).await {
+            Ok(Ok(addresses)) => return Ok(addresses),
+            Ok(Err(error)) => last = Some(ResolveError::Query(error)),
+            Err(_) => last = Some(ResolveError::Timeout),
         }
     }
     Err(last.unwrap_or(ResolveError::NoInterface))
 }
 
-fn plan_for(
-    snapshot: &InterfacePrefixes,
+/// Every (interface, source, server) triple one lookup may use, in order.
+///
+/// A configured server is the only one that will be asked: it is an operator
+/// decision, and silently asking something else instead would send the query
+/// somewhere nobody chose. Without one, each candidate interface contributes
+/// the resolvers its own DHCP lease offers, followed by its own default
+/// gateway, because a gateway that does not run a resolver is an ordinary
+/// network rather than a reason to give up.
+fn plan_queries(config: &GatewayDnsConfig) -> Result<Vec<QueryPlan>, ResolveError> {
+    let snapshots = enumerate_interface_prefixes()?;
+    let candidates = candidate_interfaces(&snapshots, config.interface.as_deref())?;
+    let mut plans: Vec<QueryPlan> = Vec::new();
+    let mut last: Option<ResolveError> = None;
+    for snapshot in candidates {
+        let leased = dhcp_dns_servers(&snapshot.interface.name).unwrap_or_default();
+        let gateway = default_gateway_ipv4(&snapshot.interface.name).ok();
+        for server in servers_for(config, &leased, gateway) {
+            match plan_for_server(snapshot, &snapshots, server, config.bind_ip) {
+                Ok(plan) => {
+                    if !plans.contains(&plan) {
+                        plans.push(plan);
+                    }
+                }
+                // An adapter whose aliases cannot reach the server is simply
+                // not this host way out. Keep looking instead of failing the
+                // whole lookup.
+                Err(error) => last = Some(error),
+            }
+        }
+    }
+    if plans.is_empty() {
+        return Err(last.unwrap_or(ResolveError::NoInterface));
+    }
+    Ok(plans)
+}
+
+/// The servers one interface contributes, most authoritative first.
+fn servers_for(
     config: &GatewayDnsConfig,
+    leased: &[Ipv4Addr],
+    gateway: Option<Ipv4Addr>,
+) -> Vec<SocketAddrV4> {
+    if let Some(server) = config.server {
+        return vec![server];
+    }
+    let mut servers: Vec<Ipv4Addr> = Vec::new();
+    // The lease is what the network operator handed this interface, so it
+    // outranks the guess that the gateway also runs a resolver.
+    servers.extend_from_slice(leased);
+    if let Some(gateway) = gateway
+        && !servers.contains(&gateway)
+    {
+        servers.push(gateway);
+    }
+    servers.truncate(MAX_PLAN_SERVERS);
+    servers
+        .into_iter()
+        .map(|server| SocketAddrV4::new(server, DNS_PORT))
+        .collect()
+}
+
+fn plan_for_server(
+    snapshot: &InterfacePrefixes,
+    snapshots: &[InterfacePrefixes],
+    server: SocketAddrV4,
+    bind_ip: Option<Ipv4Addr>,
 ) -> Result<QueryPlan, ResolveError> {
-    let (server_ip, server_port) = match config.server {
-        Some(server) => (*server.ip(), server.port()),
-        None => (default_gateway_ipv4(&snapshot.interface.name)?, DNS_PORT),
-    };
-    let bind_ip = choose_source(snapshot, server_ip, config.bind_ip)?;
+    let sources = ipv4_route_sources(snapshots, *server.ip())?;
+    let bind_ip = choose_source(snapshot, &sources, *server.ip(), bind_ip)?;
     Ok(QueryPlan {
         interface: snapshot.interface.name.clone(),
         bind_ip,
-        server: SocketAddrV4::new(server_ip, server_port),
+        server,
     })
 }
 
@@ -201,14 +282,20 @@ fn candidate_interfaces<'a>(
 
 /// Pick the source address that can actually reach the server.
 ///
-/// The server must sit inside one of the source own prefixes. A second,
-/// unrelated alias on the same adapter is not a licence to send from an
-/// address whose link cannot reach the server at all.
+/// Reachability is the routing table answer, not a same-link guess: a resolver
+/// on another subnet of the same network is reached through this interface own
+/// route, and refusing it would make the documented dns_server escape hatch
+/// unusable on exactly the networks that need it. A second, unrelated alias on
+/// the same adapter is still not a licence to send from an address whose link
+/// cannot reach the server at all.
 fn choose_source(
     snapshot: &InterfacePrefixes,
+    sources: &BTreeSet<(u32, Ipv4Addr)>,
     server: Ipv4Addr,
     bind_ip: Option<Ipv4Addr>,
 ) -> Result<Ipv4Addr, ResolveError> {
+    let index = snapshot.interface.index;
+    let usable = |address: Ipv4Addr| !address.is_loopback() && sources.contains(&(index, address));
     let on_link = |address: Ipv4Addr| {
         snapshot
             .ipv4_prefixes
@@ -220,15 +307,29 @@ fn choose_source(
         server,
     };
     match bind_ip {
-        Some(address) if on_link(address) => Ok(address),
+        Some(address) if usable(address) => Ok(address),
         Some(_) => Err(refuse()),
-        None => snapshot
-            .interface
-            .ipv4
-            .iter()
-            .copied()
-            .find(|address| on_link(*address))
-            .ok_or_else(refuse),
+        None => {
+            // An address on the server own link is preferred, so an unrelated
+            // alias that merely happens to have a route cannot win by accident.
+            let mut linked: Vec<Ipv4Addr> = snapshot
+                .interface
+                .ipv4
+                .iter()
+                .copied()
+                .filter(|address| usable(*address) && on_link(*address))
+                .collect();
+            let mut routed: Vec<Ipv4Addr> = snapshot
+                .interface
+                .ipv4
+                .iter()
+                .copied()
+                .filter(|address| usable(*address) && !on_link(*address))
+                .collect();
+            linked.sort_unstable();
+            routed.sort_unstable();
+            linked.into_iter().chain(routed).next().ok_or_else(refuse)
+        }
     }
 }
 

@@ -80,13 +80,10 @@ impl Daemon {
                 address,
                 self.resolved.config.udp_port,
             ) {
-                Ok(id) => {
-                    self.public.add_transport(
-                        id.0,
-                        self.resolved.config.stun_seeds.clone(),
-                        self.monotonic_ms(),
-                    );
-                }
+                // STUN registration is not decided here: it follows the
+                // public route of the whole socket set below, so a retained
+                // socket that gains or loses a route still converges.
+                Ok(_) => {}
                 Err(error) => {
                     record_interface_failure(&mut self.interface_failures, &name);
                     self.snapshot.session.detail = Some(format!(
@@ -95,6 +92,7 @@ impl Daemon {
                 }
             }
         }
+        self.sync_stun_registrations(&routed);
         let current = self
             .transports
             .iter()
@@ -164,6 +162,35 @@ impl Daemon {
             .collect::<Vec<_>>();
         if let Some(engines) = &mut self.engines {
             engines.set_transports(&policies);
+        }
+    }
+
+    /// Align STUN registration with the interfaces that can reach the seeds.
+    ///
+    /// Registration follows the route rather than socket lifetime: a socket on
+    /// an interface with no route to the STUN seeds can only fail its sends,
+    /// and that failure describes an exit this host cannot use, not any peer's
+    /// health. Both directions are applied on every refresh, because an
+    /// interface can gain or lose its route while its socket is retained.
+    pub(super) fn sync_stun_registrations(&mut self, routed: &std::collections::BTreeSet<u32>) {
+        let sockets = self
+            .transports
+            .iter()
+            .map(|socket| (socket.id, socket.interface_index))
+            .collect::<Vec<_>>();
+        let (register, unregister) = stun_registration_actions(&sockets, routed);
+        let servers = self.resolved.config.stun_seeds.clone();
+        let now = self.monotonic_ms();
+        // Removals first, so a full registration set of unrouted sockets cannot
+        // deny a routed one its slot. Retired sockets are already gone from the
+        // set, so this never double-cancels what `retire_transport` did.
+        for id in unregister {
+            self.public.remove_transport(id.0);
+        }
+        for id in register {
+            // `add_transport` refuses an identifier it already holds, so a
+            // retained socket keeps its pending transaction and its mappings.
+            self.public.add_transport(id.0, servers.clone(), now);
         }
     }
 
@@ -394,6 +421,26 @@ impl Daemon {
         self.snapshot.daemon.state = DaemonState::Stopped;
         self.publish_snapshot();
     }
+}
+
+/// The STUN registrations a socket set implies, as (register, unregister).
+///
+/// Split out of `sync_stun_registrations` so the route-to-registration
+/// decision is testable without reading the real kernel routing table.
+pub(super) fn stun_registration_actions(
+    sockets: &[(TransportId, u32)],
+    routed: &std::collections::BTreeSet<u32>,
+) -> (Vec<TransportId>, Vec<TransportId>) {
+    let mut register = Vec::new();
+    let mut unregister = Vec::new();
+    for (id, interface_index) in sockets {
+        if routed.contains(interface_index) {
+            register.push(*id);
+        } else {
+            unregister.push(*id);
+        }
+    }
+    (register, unregister)
 }
 
 fn record_interface_failure(failures: &mut BTreeMap<String, u64>, interface_name: &str) {

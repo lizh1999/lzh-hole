@@ -5,6 +5,7 @@
 
 #![allow(unsafe_code)]
 
+pub mod dhcp;
 pub mod dns;
 pub mod interface;
 pub mod mdns;
@@ -13,6 +14,7 @@ pub mod route;
 pub mod socket;
 pub mod tun;
 
+pub use dhcp::{MAX_DHCP_DNS_SERVERS, dhcp_dns_servers};
 pub use dns::{
     DNS_PORT, DnsError, DnsOptions, encode_a_query, parse_a_response, query_a, query_a_with,
 };

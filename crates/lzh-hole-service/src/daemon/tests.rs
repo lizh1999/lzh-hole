@@ -985,3 +985,88 @@ fn publication_mappings_cover_transports_before_older_history_and_remain_bounded
         vec![duplicate.endpoint, mapping(2, 55_001, 0).endpoint]
     );
 }
+
+/// The route-to-registration decision, independent of any real routing table.
+#[test]
+fn stun_registration_actions_follow_the_routed_interface_set_in_both_directions() {
+    let sockets = [(TransportId(1), 4), (TransportId(2), 9)];
+    let (register, unregister) =
+        lifecycle::stun_registration_actions(&sockets, &std::collections::BTreeSet::from([4]));
+    assert_eq!(register, vec![TransportId(1)]);
+    assert_eq!(unregister, vec![TransportId(2)]);
+
+    // Losing a route must move a socket onto the removal list, not merely stop
+    // registering it again.
+    let (register, unregister) =
+        lifecycle::stun_registration_actions(&sockets, &std::collections::BTreeSet::new());
+    assert!(register.is_empty());
+    assert_eq!(unregister, vec![TransportId(1), TransportId(2)]);
+
+    // Gaining a route registers a socket that was already open.
+    let (register, unregister) =
+        lifecycle::stun_registration_actions(&sockets, &std::collections::BTreeSet::from([4, 9]));
+    assert_eq!(register, vec![TransportId(1), TransportId(2)]);
+    assert!(unregister.is_empty());
+}
+
+fn registered_stun_transports(daemon: &Daemon) -> Vec<u64> {
+    daemon
+        .public
+        .mapping_behaviors()
+        .into_iter()
+        .map(|(transport, _)| transport)
+        .collect()
+}
+
+/// Loopback sockets only: the routed set is supplied by the test, so no real
+/// kernel route to a STUN seed is read, required or modified.
+#[tokio::test(flavor = "current_thread")]
+async fn stun_registration_tracks_the_route_of_a_retained_socket() {
+    let (_temp, mut daemon) = offline_daemon();
+    let id = daemon
+        .transports
+        .open(&mut daemon.transport_ids, "lo0", Ipv4Addr::LOCALHOST, 0)
+        .unwrap();
+    let index = daemon.transports.get(id).unwrap().interface_index;
+
+    daemon.sync_stun_registrations(&std::collections::BTreeSet::from([index]));
+    assert_eq!(registered_stun_transports(&daemon), vec![id.0]);
+
+    // Re-running the sync over an unchanged route must not reset the socket's
+    // in-flight STUN transaction.
+    let now = daemon.monotonic_ms();
+    assert!(
+        daemon
+            .public
+            .start_stun(id.0, [1; 12], now)
+            .unwrap()
+            .is_some()
+    );
+    daemon.sync_stun_registrations(&std::collections::BTreeSet::from([index]));
+    assert_eq!(registered_stun_transports(&daemon), vec![id.0]);
+    assert!(
+        daemon
+            .public
+            .start_stun(id.0, [2; 12], now)
+            .unwrap()
+            .is_none(),
+        "a re-sync must not discard the pending transaction"
+    );
+
+    // The route is gone: the registration goes with it, but the data-plane
+    // socket is retained for LAN discovery.
+    daemon.sync_stun_registrations(&std::collections::BTreeSet::new());
+    assert!(registered_stun_transports(&daemon).is_empty());
+    assert!(daemon.transports.get(id).is_some());
+    assert!(
+        daemon
+            .public
+            .start_stun(id.0, [3; 12], now)
+            .unwrap()
+            .is_none()
+    );
+
+    // A route appearing later registers the already open socket.
+    daemon.sync_stun_registrations(&std::collections::BTreeSet::from([index]));
+    assert_eq!(registered_stun_transports(&daemon), vec![id.0]);
+}

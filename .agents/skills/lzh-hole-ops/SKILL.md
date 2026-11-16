@@ -93,7 +93,7 @@ description: lzh-hole 多机 UDP 直连 mesh 的部署、升级、逐对配对�
 - `[lan].enabled`：默认 `true`，通过 Bonjour 发现同网段 RFC1918 候选；仍须认证握手和当前路径 PONG 才能上线。旧配置无需增加此节。
 - `stun_seeds`：1 个以上数值公网 IPv4:port，部署前确认可用。
 - `[ntfy]` **没有 topic 字段**：每条关系的 topic 由 daemon 从 finalized 配对状态推导。带 `topic` 的旧配置会被直接拒绝，必须删掉该行。
-- `[ntfy].dns_server`：仅在网关本身不提供 DNS 时指定解析器。主机名默认不经过系统解析器，而是在绑定到选定物理接口的 UDP socket 上向该接口的 IPv4 默认网关查询，因此系统解析器返回 Fake-IP 不再影响信令。
+- `[ntfy].dns_server`：显式指定唯一会被问的解析器，**不要求与本机同网段**，只要该接口有路由可达它。通常不需要配置：未配置时 daemon 会依次尝试该接口 DHCP 租约 option 6 里的解析器和它自己的 IPv4 默认网关。主机名始终不经过系统解析器，而是在绑定到选定物理接口的 UDP socket 上查询，因此系统解析器返回 Fake-IP 不再影响信令。
 - `[ntfy].resolve_ip`：最后手段，把 base_url 的 hostname 钉死到某个公网 IPv4；服务端换 IP 后必须手工更新。
 - 限制：文件 ≤64 KiB，不跟随最终 symlink，属主为 daemon effective UID 且不可 group/world 写；`udp_port` 非零；`mtu` 576–1200；路径必须是绝对路径，socket 位于专用目录。VIP/PSK 不得写入配置。
 
@@ -151,7 +151,7 @@ sudo rm /usr/local/libexec/lzh-hole   # 仅在确认不再需要时
 | 症状 | 检查 |
 |---|---|
 | STUN 发送失败或无映射 | 检查 `route -n get -ifscope <ifname> <STUN IP>`；区分公网发现故障和当前 LAN 路径健康状态 |
-| 0 个对端候选 / 信令不通 | LAN 检查 Bonjour、同网段地址和接口限制；公网检查 ntfy 状态与限流。解析失败时 doctor 的 detail 会给出 dns error 的具体原因（网关不可达、答案被拒或超时），据此判断是网关 DNS 还是网络出口问题 |
+| 0 个对端候选 / 信令不通 | LAN 检查 Bonjour、同网段地址和接口限制；公网检查 ntfy 状态与限流。解析失败时 doctor 的 detail 会给出 dns error 的具体原因（网关不可达、答案被拒或超时），据此判断是网关 DNS 还是网络出口问题。注意解析器是「DHCP option 6 → 默认网关」的链，任一可用即可；两个都不应答才是网络问题 |
 | 有候选但不 healthy | 区分 LAN / 公网候选；同出口公网路径可能受 NAT 回环限制，LAN 检查实际接口和对端地址。需要抓包时 `sudo tcpdump -ni <ifname> udp port 51000`，须用户确认，取证后停止 |
 | ping 不通但 healthy | utun 是否存在、对端 VIP `/32` 路由是否指向本程序 utun、`drops` 原因 |
 

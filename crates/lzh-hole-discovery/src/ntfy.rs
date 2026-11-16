@@ -743,6 +743,24 @@ impl NtfyTransport {
         state
             .scheduler
             .note_subscribe_started(relationship, Instant::now());
+        // A hostname that cannot be resolved makes the request impossible, so
+        // it must neither spend a rolling budget operation nor escalate this
+        // relationship's backoff: the next attempt gets the ordinary host
+        // interval instead.
+        match self.preflight_resolve(NtfyOperation::Subscribe).await {
+            Ok(()) => {}
+            Err(error @ NtfyError::Cancelled) => return Err(error),
+            Err(error) => {
+                let now = Instant::now();
+                state.stop_reader(&relationship);
+                state
+                    .scheduler
+                    .schedule_reconnect(relationship, now, MIN_HOST_INTERVAL)?;
+                return self
+                    .report_with_retry(Some(relationship), &error, state)
+                    .await;
+            }
+        }
         match self
             .reserve_operation(
                 &mut state.gate,
@@ -817,6 +835,22 @@ impl NtfyTransport {
         let command = state.pending.remove(index).expect("index from position");
         let payload = command.payload;
         if let Err(error) = check_publish_fresh(&payload, SystemTime::now()) {
+            self.report(Some(relationship), &error).await?;
+            return self
+                .emit(NtfyEvent::PublishFailed {
+                    relationship,
+                    kind: payload.kind(),
+                    request_id: payload.request_id(),
+                    detail: error.to_string(),
+                })
+                .await;
+        }
+        // A name that cannot be resolved makes the POST impossible, so the
+        // command is failed here rather than after spending a budget operation.
+        if let Err(error) = self.preflight_resolve(NtfyOperation::Publish).await {
+            if matches!(error, NtfyError::Cancelled) {
+                return Err(error);
+            }
             self.report(Some(relationship), &error).await?;
             return self
                 .emit(NtfyEvent::PublishFailed {
@@ -930,6 +964,35 @@ impl NtfyTransport {
             }
             () = sleep_until(wake) => Ok(()),
         }
+    }
+
+    /// Resolve the base URL hostname once, before any host operation is reserved.
+    ///
+    /// This is deliberately not a host operation: it takes no turn on the shared
+    /// gate, writes no pacing snapshot and spends nothing of the rolling budget,
+    /// so a network whose gateway runs no resolver cannot burn that budget on
+    /// requests that can never succeed. An IP literal host has no name to
+    /// resolve, and a configuration without an injected resolver keeps the
+    /// request path as its only resolution. The resolver bounds its own time;
+    /// cancellation still wins over waiting for an answer.
+    async fn preflight_resolve(&self, operation: NtfyOperation) -> Result<(), NtfyError> {
+        let Some(resolver) = self.config.resolver() else {
+            return Ok(());
+        };
+        let Some(host) = self.config.base_host() else {
+            return Ok(());
+        };
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Ok(());
+        }
+        let resolved = tokio::select! {
+            _ = self.cancel.cancelled() => return Err(NtfyError::Cancelled),
+            result = resolver.resolve_once(host) => result,
+        };
+        resolved.map_err(|detail| NtfyError::Http {
+            operation,
+            detail: format!("preflight resolve of {host}: {detail}"),
+        })
     }
 
     async fn reserve_operation(

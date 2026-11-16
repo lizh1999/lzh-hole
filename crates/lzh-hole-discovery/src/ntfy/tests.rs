@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use ed25519_dalek::SigningKey;
 use lzh_hole_protocol::path::{CandidateSource, Endpoint};
@@ -9,6 +9,7 @@ use super::*;
 use crate::message::{MessageKind, RequestId};
 use crate::pacing::DEFAULT_OPERATION_BUDGET;
 use crate::record::{ContactRecord, RecordCandidate};
+use crate::transport::NtfyResolver;
 
 fn signed() -> SignedPayload {
     let sender = SigningKey::from_bytes(&[7; 32]);
@@ -653,4 +654,262 @@ async fn multi_topic_pacing_persists_one_aggregate_snapshot() {
         assert!(not_before.is_u64() || not_before.is_null());
     }
     assert_eq!(previous, 3);
+}
+
+/// A resolver that answers from a fixed result, so no test touches a network.
+#[derive(Debug)]
+struct StubResolver {
+    result: Result<Vec<SocketAddr>, String>,
+}
+
+impl reqwest::dns::Resolve for StubResolver {
+    fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let result = self.result.clone();
+        Box::pin(async move {
+            match result {
+                Ok(addresses) => Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs),
+                Err(detail) => Err(Box::new(std::io::Error::other(detail))
+                    as Box<dyn std::error::Error + Send + Sync>),
+            }
+        })
+    }
+}
+
+/// A resolver that never answers, so cancellation is the only way out of it.
+#[derive(Debug)]
+struct PendingResolver;
+
+impl reqwest::dns::Resolve for PendingResolver {
+    fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(std::future::pending::<
+            Result<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>>,
+        >())
+    }
+}
+
+const GATEWAY_SILENT: &str = "gateway 192.168.31.1 did not answer";
+
+fn config_with_resolver(
+    relationship: RelationshipId,
+    result: Result<Vec<SocketAddr>, String>,
+) -> NtfyConfig {
+    single_config(relationship).with_resolver(NtfyResolver::new(StubResolver { result }))
+}
+
+/// Operations the rolling budget has already handed out.
+fn reserved_operations(state: &ActorState) -> usize {
+    state
+        .budget
+        .starts_unix_ms(Instant::now(), SystemTime::now())
+        .len()
+}
+
+#[tokio::test]
+async fn a_failed_preflight_resolve_reserves_nothing_and_keeps_the_backoff_flat() {
+    let relationship = relationship(1);
+    let store = SharedPacingStore::default();
+    let (mut transport, _handle, mut events) = NtfyTransport::channel_with_pacing_store(
+        config_with_resolver(relationship, Err(GATEWAY_SILENT.to_owned())),
+        4,
+        Box::new(store.clone()),
+    )
+    .unwrap();
+    let mut state = ActorState::new(&transport.config, 4, Instant::now());
+    let (lines_tx, _lines_rx) = mpsc::channel::<StreamMessage>(4);
+
+    // Four attempts that the old order would have escalated to a 4 minute
+    // backoff and four spent budget operations.
+    for _ in 0..4 {
+        transport
+            .start_subscribe(&mut state, relationship, &lines_tx)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        reserved_operations(&state),
+        0,
+        "an unresolvable name must not spend the rolling budget"
+    );
+    assert_eq!(
+        state.gate.remaining(Instant::now()).unwrap(),
+        Duration::ZERO,
+        "a preflight is not a host turn on the shared gate"
+    );
+    assert!(
+        store.saves().is_empty(),
+        "a preflight failure must not write durable pacing state"
+    );
+    assert_eq!(state.scheduler.failures(&relationship), Some(0));
+    assert_eq!(
+        state.scheduler.state(&relationship),
+        Some(SubscriptionState::Idle)
+    );
+    let now = Instant::now();
+    let wait = state
+        .scheduler
+        .next_attempt(&relationship)
+        .unwrap()
+        .saturating_duration_since(now);
+    assert!(
+        wait <= MIN_HOST_INTERVAL,
+        "the relationship must be retried on the ordinary host interval, not {wait:?}"
+    );
+
+    let mut errors = 0;
+    while let Ok(event) = events.try_recv() {
+        let NtfyEvent::Error {
+            relationship: source,
+            detail,
+            retry_after,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        assert_eq!(source, Some(relationship));
+        assert!(detail.contains(GATEWAY_SILENT), "{detail}");
+        assert!(retry_after.is_some_and(|wait| wait <= MIN_HOST_INTERVAL));
+        errors += 1;
+    }
+    assert_eq!(errors, 4, "every preflight failure is still reported");
+}
+
+#[tokio::test]
+async fn a_successful_preflight_resolve_reserves_the_operation_as_before() {
+    let relationship = relationship(1);
+    let store = SharedPacingStore::default();
+    // The injected resolver answers, and the transport's own address guard then
+    // refuses the loopback answer, so no packet ever leaves this host.
+    let (mut transport, _handle, mut events) = NtfyTransport::channel_with_pacing_store(
+        config_with_resolver(
+            relationship,
+            Ok(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 443))]),
+        ),
+        4,
+        Box::new(store.clone()),
+    )
+    .unwrap();
+    let mut state = ActorState::new(&transport.config, 4, Instant::now());
+    let (lines_tx, _lines_rx) = mpsc::channel::<StreamMessage>(4);
+
+    transport
+        .start_subscribe(&mut state, relationship, &lines_tx)
+        .await
+        .unwrap();
+
+    assert_eq!(reserved_operations(&state), 1);
+    assert!(
+        state.gate.remaining(Instant::now()).unwrap() > Duration::from_secs(29),
+        "a reserved operation still takes its turn on the shared gate"
+    );
+    let saves = store.saves();
+    assert_eq!(saves.len(), 1, "one snapshot per HTTP attempt");
+    let snapshot: serde_json::Value = serde_json::from_slice(&saves[0]).unwrap();
+    assert_eq!(
+        snapshot["operation_starts_unix_ms"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(state.scheduler.failures(&relationship), Some(1));
+
+    let mut refused = false;
+    while let Ok(event) = events.try_recv() {
+        if let NtfyEvent::Error { detail, .. } = event {
+            refused = refused || detail.contains("refused address");
+        }
+    }
+    assert!(
+        refused,
+        "the attempt must fail on the address guard rather than on a socket"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_preflight_resolve_fails_the_publish_without_reserving_an_operation() {
+    let relationship = relationship(1);
+    let store = SharedPacingStore::default();
+    let (mut transport, handle, mut events) = NtfyTransport::channel_with_pacing_store(
+        config_with_resolver(relationship, Err(GATEWAY_SILENT.to_owned())),
+        4,
+        Box::new(store.clone()),
+    )
+    .unwrap();
+    let payload = signed();
+    let (kind, request_id) = (payload.kind(), payload.request_id());
+    handle.try_publish(relationship, payload).unwrap();
+    let mut state = ActorState::new(&transport.config, 4, Instant::now());
+    transport.drain_commands(&mut state);
+
+    transport
+        .run_publish(&mut state, relationship)
+        .await
+        .unwrap();
+
+    assert!(state.pending.is_empty());
+    assert_eq!(reserved_operations(&state), 0);
+    assert_eq!(
+        state.gate.remaining(Instant::now()).unwrap(),
+        Duration::ZERO
+    );
+    assert!(
+        store.saves().is_empty(),
+        "a preflight failure must not write durable pacing state"
+    );
+
+    let mut failed = false;
+    while let Ok(event) = events.try_recv() {
+        let NtfyEvent::PublishFailed {
+            relationship: source,
+            kind: event_kind,
+            request_id: event_id,
+            detail,
+        } = event
+        else {
+            continue;
+        };
+        assert_eq!(source, relationship);
+        assert_eq!(event_kind, kind);
+        assert_eq!(event_id, request_id);
+        assert!(detail.contains(GATEWAY_SILENT), "{detail}");
+        failed = true;
+    }
+    assert!(failed, "a preflight failure must surface as PublishFailed");
+}
+
+#[tokio::test]
+async fn preflight_is_skipped_without_a_resolver_and_for_an_ip_literal_host() {
+    let (transport, _handle, _events) =
+        NtfyTransport::channel(single_config(relationship(1)), 4).unwrap();
+    transport
+        .preflight_resolve(NtfyOperation::Subscribe)
+        .await
+        .expect("a configuration without an injected resolver has nothing to preflight");
+
+    let config = NtfyConfig::new("https://192.0.2.10", "topic-1")
+        .unwrap()
+        .with_relationship(relationship(1))
+        .unwrap()
+        .with_resolver(NtfyResolver::new(StubResolver {
+            result: Err("an IP literal host has no name to resolve".to_owned()),
+        }));
+    let (transport, _handle, _events) = NtfyTransport::channel(config, 4).unwrap();
+    transport
+        .preflight_resolve(NtfyOperation::Publish)
+        .await
+        .expect("an IP literal host must not be resolved");
+}
+
+#[tokio::test]
+async fn a_cancelled_actor_does_not_wait_for_a_preflight_resolve() {
+    let relationship = relationship(1);
+    let config = single_config(relationship).with_resolver(NtfyResolver::new(PendingResolver));
+    let (transport, handle, _events) = NtfyTransport::channel(config, 4).unwrap();
+    handle.cancel();
+    assert!(matches!(
+        transport.preflight_resolve(NtfyOperation::Subscribe).await,
+        Err(NtfyError::Cancelled)
+    ));
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
@@ -55,6 +56,10 @@ fn lan() -> InterfacePrefixes {
     )
 }
 
+fn sources(entries: &[(u32, Ipv4Addr)]) -> BTreeSet<(u32, Ipv4Addr)> {
+    entries.iter().copied().collect()
+}
+
 #[test]
 fn a_requested_interface_must_be_a_usable_physical_one() {
     let snapshots = vec![
@@ -107,92 +112,166 @@ fn a_requested_interface_must_be_a_usable_physical_one() {
 }
 
 #[test]
-fn a_candidate_without_a_way_out_is_skipped_rather_than_fatal() {
-    // Two real adapters: the first cannot reach the server from any alias, so
-    // planning must fall through to the second instead of failing outright.
-    let first = snapshot(
-        "en0",
-        14,
-        &[(Ipv4Addr::new(192, 168, 1, 2), 24)],
-        true,
-        false,
-        false,
+fn a_configured_server_is_the_only_one_that_will_be_asked() {
+    let configured = SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 252), 53);
+    let config = GatewayDnsConfig::default().with_server(*configured.ip());
+    let leased = [Ipv4Addr::new(223, 5, 5, 5)];
+    // Neither the lease nor the gateway may displace an operator decision.
+    assert_eq!(
+        servers_for(&config, &leased, Some(Ipv4Addr::new(192, 168, 8, 1))),
+        vec![configured]
     );
-    let second = snapshot(
-        "en1",
-        15,
-        &[(Ipv4Addr::new(192, 168, 31, 156), 24)],
-        true,
-        false,
-        false,
+    // A configured port is preserved rather than forced back to 53.
+    let config = GatewayDnsConfig {
+        server: Some(SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 252), 5353)),
+        ..GatewayDnsConfig::default()
+    };
+    assert_eq!(
+        servers_for(&config, &leased, None),
+        vec![SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 252), 5353)]
     );
-    let server = Ipv4Addr::new(192, 168, 31, 1);
-    assert!(plan_for(&first, &GatewayDnsConfig::default().with_server(server)).is_err());
-    let plan = plan_for(&second, &GatewayDnsConfig::default().with_server(server)).unwrap();
-    assert_eq!(plan.interface, "en1");
-    assert_eq!(plan.bind_ip, Ipv4Addr::new(192, 168, 31, 156));
-    assert_eq!(plan.server, SocketAddrV4::new(server, 53));
 }
 
 #[test]
-fn a_source_address_must_share_a_link_with_the_server() {
+fn a_lease_outranks_the_gateway_and_the_list_stays_bounded() {
+    let config = GatewayDnsConfig::default();
+    let leased = [
+        Ipv4Addr::new(192, 168, 0, 252),
+        Ipv4Addr::new(192, 168, 0, 253),
+    ];
+    let gateway = Ipv4Addr::new(192, 168, 8, 1);
+    assert_eq!(
+        servers_for(&config, &leased, Some(gateway)),
+        vec![
+            SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 252), DNS_PORT),
+            SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 253), DNS_PORT),
+            SocketAddrV4::new(gateway, DNS_PORT),
+        ]
+    );
+    // A gateway that the lease already lists is not asked twice.
+    assert_eq!(
+        servers_for(&config, &[gateway], Some(gateway)),
+        vec![SocketAddrV4::new(gateway, DNS_PORT)]
+    );
+    // A network with no lease still gets the gateway.
+    assert_eq!(
+        servers_for(&config, &[], Some(gateway)),
+        vec![SocketAddrV4::new(gateway, DNS_PORT)]
+    );
+    // A network with neither contributes nothing rather than inventing one.
+    assert!(servers_for(&config, &[], None).is_empty());
+
+    let many: Vec<Ipv4Addr> = (1..=8u8)
+        .map(|last| Ipv4Addr::new(10, 0, 0, last))
+        .collect();
+    let servers = servers_for(&config, &many, Some(gateway));
+    assert_eq!(servers.len(), MAX_PLAN_SERVERS);
+    assert_eq!(
+        servers[0],
+        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), DNS_PORT)
+    );
+}
+
+#[test]
+fn a_resolver_on_another_subnet_is_reachable_through_the_interface_route() {
+    // The regression this exists for: a leased resolver on 192.168.0.0/24
+    // while the interface address is on 192.168.8.0/23. A same-link rule
+    // refuses it, and refusing it makes the documented escape hatch useless on
+    // exactly the networks that need it.
+    let interface = snapshot(
+        "en7",
+        26,
+        &[(Ipv4Addr::new(192, 168, 8, 164), 23)],
+        true,
+        false,
+        false,
+    );
+    let leased = Ipv4Addr::new(192, 168, 0, 252);
+    let routed = sources(&[(26, Ipv4Addr::new(192, 168, 8, 164))]);
+    assert_eq!(
+        choose_source(&interface, &routed, leased, None).unwrap(),
+        Ipv4Addr::new(192, 168, 8, 164)
+    );
+    assert_eq!(
+        choose_source(
+            &interface,
+            &routed,
+            leased,
+            Some(Ipv4Addr::new(192, 168, 8, 164))
+        )
+        .unwrap(),
+        Ipv4Addr::new(192, 168, 8, 164)
+    );
+    // Without a route the same address is refused, so a dead alias cannot be
+    // used just because it happens to be configured.
+    assert!(matches!(
+        choose_source(&interface, &BTreeSet::new(), leased, None),
+        Err(ResolveError::NoSource { .. })
+    ));
+}
+
+#[test]
+fn an_alias_on_the_server_own_link_wins_over_an_unrelated_routable_alias() {
     let gateway = Ipv4Addr::new(192, 168, 31, 1);
-    let dual = snapshot(
+    let wan = Ipv4Addr::new(192, 168, 1, 2);
+    let lan = Ipv4Addr::new(192, 168, 31, 10);
+    let dual = snapshot("en0", 14, &[(wan, 24), (lan, 24)], true, false, false);
+    let both = sources(&[(14, wan), (14, lan)]);
+    // Both aliases have a route; the one that shares the server link wins.
+    assert_eq!(choose_source(&dual, &both, gateway, None).unwrap(), lan);
+    // An explicitly bound address that has no route is still refused.
+    let only_lan = sources(&[(14, lan)]);
+    assert!(matches!(
+        choose_source(&dual, &only_lan, gateway, Some(wan)),
+        Err(ResolveError::NoSource { .. })
+    ));
+    // A source on another interface never satisfies this interface.
+    assert!(matches!(
+        choose_source(&dual, &sources(&[(15, lan)]), gateway, None),
+        Err(ResolveError::NoSource { .. })
+    ));
+}
+
+#[test]
+fn a_loopback_address_is_never_a_dns_source() {
+    let interface = snapshot(
         "en0",
         14,
         &[
-            (Ipv4Addr::new(192, 168, 1, 2), 24),
+            (Ipv4Addr::LOCALHOST, 8),
             (Ipv4Addr::new(192, 168, 31, 10), 24),
         ],
         true,
         false,
         false,
     );
-    // The alias on the gateway link wins over the unrelated alias.
+    let both = sources(&[
+        (14, Ipv4Addr::LOCALHOST),
+        (14, Ipv4Addr::new(192, 168, 31, 10)),
+    ]);
+    let server = Ipv4Addr::new(192, 168, 31, 1);
     assert_eq!(
-        choose_source(&dual, gateway, None).unwrap(),
+        choose_source(&interface, &both, server, None).unwrap(),
         Ipv4Addr::new(192, 168, 31, 10)
     );
-    assert_eq!(
-        choose_source(&dual, gateway, Some(Ipv4Addr::new(192, 168, 31, 10))).unwrap(),
-        Ipv4Addr::new(192, 168, 31, 10)
-    );
-    // An explicitly bound address that cannot reach the server is refused.
-    assert!(matches!(
-        choose_source(&dual, gateway, Some(Ipv4Addr::new(192, 168, 1, 2))),
-        Err(ResolveError::NoSource { .. })
-    ));
-
-    let single = snapshot(
-        "en0",
-        14,
-        &[(Ipv4Addr::new(192, 168, 1, 2), 24)],
-        true,
-        false,
-        false,
-    );
-    assert!(matches!(
-        choose_source(&single, gateway, None),
-        Err(ResolveError::NoSource { .. })
-    ));
 }
 
 /// Host-specific evidence, run explicitly with --ignored --nocapture.
-/// No packet is sent; only interfaces and routes are read.
+/// No packet is sent; only interfaces, routes and DHCP leases are read.
 #[test]
-#[ignore = "prints the current host's ntfy DNS plan"]
-fn inspect_query_plan() {
+#[ignore = "prints the current host's ntfy DNS plans"]
+fn inspect_query_plans() {
     println!(
-        "default: {:?}",
-        GatewayDnsResolver::new(GatewayDnsConfig::default()).plan()
+        "default: {:#?}",
+        GatewayDnsResolver::new(GatewayDnsConfig::default()).plans()
     );
-    for name in ["en0", "en1", "awdl0", "lo0", "utun0"] {
+    for name in ["en0", "en1", "en7", "awdl0", "lo0", "utun0"] {
         let resolver = GatewayDnsResolver::new(GatewayDnsConfig {
             interface: Some(name.to_owned()),
             bind_ip: None,
             server: None,
         });
-        println!("{name}: {:?}", resolver.plan());
+        println!("{name}: {:?}", resolver.plans());
     }
 }
 
@@ -204,7 +283,7 @@ async fn an_unusable_plan_fails_before_any_packet_is_sent() {
         server: None,
     });
     assert!(matches!(
-        resolver.plan(),
+        resolver.plans(),
         Err(ResolveError::UnknownInterface(_))
     ));
     let name = reqwest::dns::Name::from_str("ntfy.sh").unwrap();
