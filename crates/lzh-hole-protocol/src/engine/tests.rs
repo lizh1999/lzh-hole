@@ -155,6 +155,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exhausted_hello_recovers_after_initial_eight_second_blackout() {
+        let mut pair = pair();
+        let mut hellos = Vec::new();
+        let mut recovered = None;
+        for elapsed in (0..=15_000).step_by(250) {
+            let now = START + elapsed;
+            if elapsed % 5_000 == 0 {
+                pair.a.set_candidates(&[pair.b_endpoint]);
+                pair.b.set_candidates(&[pair.a_endpoint]);
+            }
+            pair.a.tick(now);
+            pair.b.tick(now);
+            // Observe real engine output, not a second handshake simulation.
+            let queued = pair
+                .a
+                .udp_out
+                .iter()
+                .filter(|frame| {
+                    parse_frame(&frame.bytes).unwrap().header.frame_type == FrameType::Hello
+                })
+                .count();
+            hellos.extend(std::iter::repeat_n(elapsed, queued));
+            pump(&mut pair, now, elapsed >= 8_000);
+            if pair.a.snapshot(now).currently_healthy && pair.b.snapshot(now).currently_healthy {
+                recovered = Some(elapsed);
+                break;
+            }
+        }
+        assert_eq!(
+            &hellos[..8],
+            &[0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000]
+        );
+        assert!((9_000..=9_250).contains(&hellos[8]), "{hellos:?}");
+        assert!(
+            recovered.is_some_and(|elapsed| elapsed <= 12_000),
+            "{recovered:?}"
+        );
+    }
+
+    #[test]
+    fn exhausted_hellos_do_not_restart_on_every_tick_or_candidate_refresh() {
+        let mut pair = pair();
+        let mut sends = Vec::new();
+        for elapsed in (0..=30_000).step_by(10) {
+            pair.a.set_candidates(&[pair.b_endpoint]);
+            pair.a.tick(START + elapsed);
+            while let Some(frame) = pair.a.next_udp_frame() {
+                if parse_frame(&frame.bytes).unwrap().header.frame_type == FrameType::Hello {
+                    sends.push(elapsed);
+                }
+            }
+        }
+        assert!(sends.len() <= 28, "{sends:?}");
+        assert!(sends.windows(2).all(|times| times[1] - times[0] >= 1_000));
+        assert!(sends[8] >= 9_000);
+    }
+
     fn ipv4(
         source: Ipv4Addr,
         destination: Ipv4Addr,

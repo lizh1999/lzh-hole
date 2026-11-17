@@ -41,6 +41,8 @@ pub const ATTEMPT_TTL_MS: u64 = 90_000;
 pub const RETRANSMIT_INTERVAL_MS: u64 = 1_000;
 /// Retransmissions allowed per entry within its TTL.
 pub const MAX_RETRANSMITS: u32 = 8;
+/// Response grace/backoff after the last HELLO, before fresh nonces may retry.
+pub const EXHAUSTED_HELLO_GRACE_MS: u64 = 2_000;
 /// Bound on a rekey intent.
 pub const REKEY_INTENT_TTL_MS: u64 = 90_000;
 /// Tolerance for a handshake timestamp.
@@ -406,8 +408,15 @@ impl Handshake {
         self.seen_probes.retain(|p| now_ms <= p.expires_ms);
         let before = self.attempts.len() + self.responder.len();
 
-        self.attempts
-            .retain(|a| now_ms.saturating_sub(a.created_ms) < ATTEMPT_TTL_MS);
+        self.attempts.retain(|a| {
+            // A spent HELLO must not silently occupy a path for the full TTL.
+            // Keep a final response grace and never retire a FINISH winner here:
+            // its session/unique transcript survives until normal offline reset.
+            now_ms.saturating_sub(a.created_ms) < ATTEMPT_TTL_MS
+                && (a.awaiting_ack
+                    || a.sends < MAX_RETRANSMITS
+                    || now_ms.saturating_sub(a.last_send_ms) < EXHAUSTED_HELLO_GRACE_MS)
+        });
         self.responder
             .retain(|e| now_ms.saturating_sub(e.created_ms) < ATTEMPT_TTL_MS);
         if self.attempts.len() + self.responder.len() != before {

@@ -6,17 +6,17 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{StreamExt, TryStreamExt};
 use lzh_hole_types::RelationshipId;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 use tokio_util::codec::LinesCodecError;
 use tokio_util::sync::CancellationToken;
 
-use crate::message::SignedPayload;
+use crate::message::{MessageKind, RequestId, SignedPayload};
 use crate::pacing::{
     HostGate, MIN_HOST_INTERVAL, MISSING_RETRY_AFTER_BACKOFF, OPERATION_WINDOW, OperationBudget,
     PacingSnapshot, reconnect_delay,
@@ -314,6 +314,68 @@ pub(crate) fn next_host_operation(
 pub(crate) struct PublishCommand {
     pub(crate) relationship: RelationshipId,
     pub(crate) payload: SignedPayload,
+    // Only requests are coalesced. Replies retain their original correlation.
+    superseded: CancellationToken,
+    fallback: Option<SignedPayload>,
+    offer_revoked: CancellationToken,
+}
+
+impl PublishCommand {
+    fn payload_for_publish(&self, now: SystemTime) -> Result<&SignedPayload, NtfyError> {
+        let admission = if self.offer_revoked.is_cancelled() {
+            Err(NtfyError::PublishOfferUnavailable {
+                kind: self.payload.kind(),
+                request_id: self.payload.request_id(),
+                expires_at_unix_ms: self
+                    .payload
+                    .expires_at_unix_ms()
+                    .map_err(|error| NtfyError::Protocol(error.to_string()))?,
+            })
+        } else {
+            check_publish_fresh(&self.payload, now)
+        };
+        match (admission, &self.fallback) {
+            (Ok(()), _) => Ok(&self.payload),
+            (Err(_), Some(fallback)) => {
+                check_publish_fresh(fallback, now)?;
+                Ok(fallback)
+            }
+            (Err(error), None) => Err(error),
+        }
+    }
+}
+
+// Only PublishOfferUnavailable proves that publish refused before request.send().
+// Reusing the existing reservation here is a local choice, not an HTTP retry.
+async fn publish_with_fallback<'a, F>(
+    command: &'a PublishCommand,
+    payload: &'a SignedPayload,
+    cancel: &CancellationToken,
+    mut post: impl FnMut(&'a SignedPayload) -> F,
+) -> Result<(), NtfyError>
+where
+    F: std::future::Future<Output = Result<(), NtfyError>>,
+{
+    let result = post(payload).await;
+    if matches!(&result, Err(NtfyError::PublishOfferUnavailable { .. }))
+        && let Some(fallback) = &command.fallback
+    {
+        if cancel.is_cancelled() {
+            return Err(NtfyError::Cancelled);
+        }
+        if !command.superseded.is_cancelled() {
+            // The transport checks fallback freshness again, then starts at most
+            // one HTTP request. Every HTTP/timeout/status failure is terminal.
+            return post(fallback).await;
+        }
+    }
+    result
+}
+
+#[derive(Debug)]
+struct RequestPublication {
+    id: RequestId,
+    superseded: CancellationToken,
 }
 
 /// Messages a reader task sends back to the actor. A reader task never performs
@@ -397,6 +459,9 @@ fn stream_capacity(capacity: usize) -> usize {
 pub struct NtfyHandle {
     outgoing: mpsc::Sender<PublishCommand>,
     served: Arc<BTreeMap<RelationshipId, String>>,
+    requests: Arc<Mutex<BTreeMap<RelationshipId, RequestPublication>>>,
+    offers: Arc<Mutex<BTreeMap<RelationshipId, CancellationToken>>>,
+    changed: Arc<Notify>,
     cancel: CancellationToken,
 }
 
@@ -410,21 +475,129 @@ impl NtfyHandle {
         relationship: RelationshipId,
         payload: SignedPayload,
     ) -> Result<(), TryPublishError> {
+        self.queue_publication(relationship, payload, None)
+    }
+
+    /// Queue exactly one POST, choosing the signed no-offer alternative if the
+    /// offer expires in the queue or its local socket window closes. Both
+    /// sequences MUST already be durably reserved. Correlation is unchanged.
+    pub fn try_publish_with_fallback(
+        &self,
+        relationship: RelationshipId,
+        offer: SignedPayload,
+        fallback: SignedPayload,
+    ) -> Result<(), TryPublishError> {
+        let invalid = |error: crate::message::PayloadError| {
+            TryPublishError::InvalidPayload(error.to_string())
+        };
+        let mut expected = offer.contact_record().map_err(invalid)?;
+        let normal = fallback.contact_record().map_err(invalid)?;
+        if expected.flags & crate::record::FLAG_PUNCH_OFFER == 0
+            || normal.flags & crate::record::FLAG_PUNCH_OFFER != 0
+            || normal.record_seq <= expected.record_seq
+            || normal.expires_at_unix_ms < expected.expires_at_unix_ms
+            || offer.kind() != fallback.kind()
+            || offer.request_id() != fallback.request_id()
+        {
+            return Err(TryPublishError::InvalidPayload(
+                "invalid no-offer alternative".to_owned(),
+            ));
+        }
+        expected.flags &= !crate::record::FLAG_PUNCH_OFFER;
+        expected.record_seq = normal.record_seq;
+        expected.expires_at_unix_ms = normal.expires_at_unix_ms;
+        if expected != normal {
+            return Err(TryPublishError::InvalidPayload(
+                "no-offer alternative changed the snapshot".to_owned(),
+            ));
+        }
+        fallback.to_json().map_err(invalid)?;
+        self.queue_publication(relationship, offer, Some(fallback))
+    }
+
+    fn queue_publication(
+        &self,
+        relationship: RelationshipId,
+        payload: SignedPayload,
+        fallback: Option<SignedPayload>,
+    ) -> Result<(), TryPublishError> {
         if !self.served.contains_key(&relationship) {
             return Err(TryPublishError::UnknownRelationship(relationship));
         }
         payload
             .to_json()
             .map_err(|e| TryPublishError::InvalidPayload(e.to_string()))?;
+        let mut requests = self.requests.lock().expect("publication lock poisoned");
+        let mut offers = self.offers.lock().expect("publication lock poisoned");
+        let is_offer = payload
+            .contact_record()
+            .map_err(|error| TryPublishError::InvalidPayload(error.to_string()))?
+            .flags
+            & crate::record::FLAG_PUNCH_OFFER
+            != 0;
+        let offer_revoked = if is_offer {
+            offers.get(&relationship).cloned().unwrap_or_default()
+        } else {
+            CancellationToken::new()
+        };
+        let superseded = CancellationToken::new();
+        let request = (payload.kind() == MessageKind::Request).then(|| RequestPublication {
+            id: payload.request_id(),
+            superseded: superseded.clone(),
+        });
         self.outgoing
             .try_send(PublishCommand {
                 relationship,
                 payload,
+                superseded,
+                fallback,
+                offer_revoked: offer_revoked.clone(),
             })
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => TryPublishError::Full,
                 mpsc::error::TrySendError::Closed(_) => TryPublishError::Closed,
-            })
+            })?;
+        if is_offer {
+            offers.insert(relationship, offer_revoked);
+        }
+        // Do not invalidate a usable command if the replacement was refused.
+        if let Some(request) = request
+            && let Some(old) = requests.insert(relationship, request)
+        {
+            old.superseded.cancel();
+        }
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// Revoke an obsolete queued request, including one still in the channel.
+    /// Does not revoke replies or claim to undo an HTTP request already started.
+    pub fn cancel_request(&self, relationship: RelationshipId, id: RequestId) {
+        let mut requests = self.requests.lock().expect("publication lock poisoned");
+        if requests
+            .get(&relationship)
+            .is_some_and(|request| request.id == id)
+        {
+            if let Some(request) = requests.remove(&relationship) {
+                request.superseded.cancel();
+            }
+            self.changed.notify_one();
+        }
+    }
+
+    /// Close this relationship's advertised socket window. Queued replies keep
+    /// their request IDs and use their signed no-offer alternative, if supplied.
+    /// An already-started POST is not cancelled or represented as unsent.
+    pub fn cancel_offers(&self, relationship: RelationshipId) {
+        if let Some(token) = self
+            .offers
+            .lock()
+            .expect("publication lock poisoned")
+            .remove(&relationship)
+        {
+            token.cancel();
+            self.changed.notify_one();
+        }
     }
 
     /// Cancel connection attempts, backoff sleeps, publishing and stream reads.
@@ -492,6 +665,7 @@ pub struct NtfyTransport {
     config: NtfyConfig,
     client: reqwest::Client,
     outgoing: mpsc::Receiver<PublishCommand>,
+    changed: Arc<Notify>,
     events: mpsc::Sender<NtfyEvent>,
     cancel: CancellationToken,
     pacing_store: Option<Box<dyn NtfyPacingStore>>,
@@ -535,9 +709,13 @@ impl NtfyTransport {
         let (outgoing_tx, outgoing) = mpsc::channel(capacity);
         let (events, event_rx) = mpsc::channel(capacity);
         let cancel = CancellationToken::new();
+        let changed = Arc::new(Notify::new());
         let handle = NtfyHandle {
             outgoing: outgoing_tx,
             served: Arc::new(config.topics.clone()),
+            requests: Arc::new(Mutex::new(BTreeMap::new())),
+            offers: Arc::new(Mutex::new(BTreeMap::new())),
+            changed: changed.clone(),
             cancel: cancel.clone(),
         };
         Ok((
@@ -545,6 +723,7 @@ impl NtfyTransport {
                 config,
                 client,
                 outgoing,
+                changed,
                 events,
                 cancel,
                 pacing_store,
@@ -577,7 +756,7 @@ impl NtfyTransport {
         loop {
             self.drain_streams(&mut state, &mut lines_rx).await?;
             self.expire_idle(&mut state).await?;
-            self.drain_commands(&mut state);
+            self.drain_commands(&mut state).await?;
             let ready = state.ready_publishes();
             let decision = next_host_operation(
                 &state.scheduler,
@@ -606,10 +785,42 @@ impl NtfyTransport {
         }
     }
 
-    fn drain_commands(&mut self, state: &mut ActorState) {
-        while !state.commands_closed && state.pending.len() < state.capacity {
+    async fn discard_superseded(&self, command: &PublishCommand) -> Result<bool, NtfyError> {
+        if !command.superseded.is_cancelled() {
+            return Ok(false);
+        }
+        self.emit(NtfyEvent::PublishFailed {
+            relationship: command.relationship,
+            kind: command.payload.kind(),
+            request_id: command.payload.request_id(),
+            detail: "obsolete queued request superseded before POST".to_owned(),
+        })
+        .await?;
+        Ok(true)
+    }
+
+    async fn drain_commands(&mut self, state: &mut ActorState) -> Result<(), NtfyError> {
+        // Prune before admitting more commands, including when the queue was full.
+        let mut index = 0;
+        while index < state.pending.len() {
+            if state.pending[index].superseded.is_cancelled() {
+                let command = state.pending.remove(index).expect("valid index");
+                self.discard_superseded(&command).await?;
+            } else {
+                index += 1;
+            }
+        }
+        // A stream of superseded requests must not keep this pass unbounded.
+        for _ in 0..state.capacity {
+            if state.commands_closed || state.pending.len() >= state.capacity {
+                break;
+            }
             match self.outgoing.try_recv() {
-                Ok(command) => state.pending.push_back(command),
+                Ok(command) => {
+                    if !self.discard_superseded(&command).await? {
+                        state.pending.push_back(command);
+                    }
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     state.commands_closed = true;
@@ -617,6 +828,7 @@ impl NtfyTransport {
                 }
             }
         }
+        Ok(())
     }
 
     async fn drain_streams(
@@ -820,6 +1032,26 @@ impl NtfyTransport {
         Ok(())
     }
 
+    async fn admitted_payload<'a>(
+        &self,
+        command: &'a PublishCommand,
+    ) -> Result<Option<&'a SignedPayload>, NtfyError> {
+        match command.payload_for_publish(SystemTime::now()) {
+            Ok(payload) => Ok(Some(payload)),
+            Err(error) => {
+                self.report(Some(command.relationship), &error).await?;
+                self.emit(NtfyEvent::PublishFailed {
+                    relationship: command.relationship,
+                    kind: command.payload.kind(),
+                    request_id: command.payload.request_id(),
+                    detail: error.to_string(),
+                })
+                .await?;
+                Ok(None)
+            }
+        }
+    }
+
     async fn run_publish(
         &mut self,
         state: &mut ActorState,
@@ -833,18 +1065,12 @@ impl NtfyTransport {
             return Ok(());
         };
         let command = state.pending.remove(index).expect("index from position");
-        let payload = command.payload;
-        if let Err(error) = check_publish_fresh(&payload, SystemTime::now()) {
-            self.report(Some(relationship), &error).await?;
-            return self
-                .emit(NtfyEvent::PublishFailed {
-                    relationship,
-                    kind: payload.kind(),
-                    request_id: payload.request_id(),
-                    detail: error.to_string(),
-                })
-                .await;
+        if self.discard_superseded(&command).await? {
+            return Ok(());
         }
+        let Some(payload) = self.admitted_payload(&command).await? else {
+            return Ok(());
+        };
         // A name that cannot be resolved makes the POST impossible, so the
         // command is failed here rather than after spending a budget operation.
         if let Err(error) = self.preflight_resolve(NtfyOperation::Publish).await {
@@ -861,6 +1087,13 @@ impl NtfyTransport {
                 })
                 .await;
         }
+        // DNS may have yielded to a newer request or consumed the offer margin.
+        if self.discard_superseded(&command).await? {
+            return Ok(());
+        }
+        let Some(payload) = self.admitted_payload(&command).await? else {
+            return Ok(());
+        };
         match self
             .reserve_operation(
                 &mut state.gate,
@@ -884,13 +1117,23 @@ impl NtfyTransport {
             Err(error) => return Err(error),
         }
         state.last = Some(NtfyOperation::Publish);
-        match publish(
-            &self.client,
-            &self.config,
-            relationship,
-            &self.cancel,
-            &payload,
-        )
+        // Durable pacing storage can block too. Re-select after that boundary;
+        // a reservation is never refunded, even if revocation now prevents HTTP.
+        if self.discard_superseded(&command).await? {
+            return Ok(());
+        }
+        let Some(payload) = self.admitted_payload(&command).await? else {
+            return Ok(());
+        };
+        match publish_with_fallback(&command, payload, &self.cancel, |payload| {
+            publish(
+                &self.client,
+                &self.config,
+                relationship,
+                &self.cancel,
+                payload,
+            )
+        })
         .await
         {
             Ok(()) => {
@@ -942,6 +1185,7 @@ impl NtfyTransport {
         let can_queue = state.pending.len() < state.capacity && !state.commands_closed;
         tokio::select! {
             _ = self.cancel.cancelled() => Err(NtfyError::Cancelled),
+            () = self.changed.notified() => Ok(()),
             message = lines_rx.recv() => {
                 match message {
                     Some(message) => self.handle_stream_message(state, message).await,

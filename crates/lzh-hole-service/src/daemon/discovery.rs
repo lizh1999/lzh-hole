@@ -86,11 +86,19 @@ impl Daemon {
             .collect::<Vec<_>>();
         for id in self.peer_order.clone() {
             let flags = self.record_flags_for(id);
+            if flags & lzh_hole_discovery::record::FLAG_PUNCH_OFFER == 0
+                && let Some(handle) = &self.ntfy_handle
+            {
+                handle.cancel_offers(id);
+            }
             let Some(peer) = self.peers.get_mut(&id) else {
                 continue;
             };
             if let Some(request) = peer.public.request_refresh_needed(now, &mappings, flags) {
                 peer.exchange.cancel_request(request);
+                if let Some(handle) = &self.ntfy_handle {
+                    handle.cancel_request(id, request);
+                }
             }
         }
     }

@@ -18,7 +18,7 @@ use lzh_hole_control::{ByteCounters, ComponentState, ComponentStatus, DropCounte
 use lzh_hole_discovery::candidate::CandidateSource;
 use lzh_hole_discovery::peer_record::PeerRecordPolicy;
 use lzh_hole_discovery::record::{
-    ContactRecord, MAX_LIFETIME_MS, RecordCandidate, reserve_sequence,
+    ContactRecord, FLAG_PUNCH_OFFER, MAX_LIFETIME_MS, RecordCandidate, reserve_sequence,
 };
 use lzh_hole_discovery::{
     Delivery, DiscoveryUpdate, ExchangeAction, ExchangeTracker, MessageKind, NtfyHandle,
@@ -260,6 +260,25 @@ pub(super) struct NodeFacts<'a> {
     pub punch_offer_deadline: Option<u64>,
 }
 
+struct Publication {
+    payload: SignedPayload,
+    fallback: Option<SignedPayload>,
+    expires_at_unix_ms: u64,
+}
+
+fn publication_validity(flags: u8, deadline: Option<u64>, now: u64) -> (u8, u64) {
+    let normal_expiry = now.saturating_add(MAX_LIFETIME_MS);
+    if flags & FLAG_PUNCH_OFFER != 0
+        && let Some(deadline) = deadline
+        && deadline
+            > now.saturating_add(lzh_hole_discovery::transport::MIN_PUNCH_OFFER_REMAINING_MS)
+    {
+        return (flags, deadline.min(normal_expiry));
+    }
+    // A short/closed offer must not shorten the normal candidate advertisement.
+    (flags & !FLAG_PUNCH_OFFER, normal_expiry)
+}
+
 impl NodeFacts<'_> {
     /// This node's own endpoints, which no peer's record may name as a target.
     pub fn own_endpoints(&self) -> Vec<Endpoint> {
@@ -290,7 +309,45 @@ impl NodeFacts<'_> {
         kind: MessageKind,
         id: RequestId,
     ) -> Result<u64, String> {
-        let now = now_unix_ms();
+        let publication = self.build_publication(peer, kind, id)?;
+        let handle = self
+            .ntfy_handle
+            .ok_or_else(|| "ntfy transport is not running".to_owned())?;
+        match publication.fallback {
+            Some(fallback) => handle.try_publish_with_fallback(
+                peer.relationship_id,
+                publication.payload,
+                fallback,
+            ),
+            None => handle.try_publish(peer.relationship_id, publication.payload),
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(publication.expires_at_unix_ms)
+    }
+
+    fn reserve_record_sequence(&self, peer: &PeerRuntime) -> Result<u64, String> {
+        let durable = self
+            .state
+            .load_sequence(peer.relationship_id)
+            .map_err(|error| error.to_string())?;
+        let sequence = reserve_sequence(
+            durable,
+            peer.peer_cache.highest_seq().unwrap_or(0),
+            now_unix_us(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.state
+            .store_sequence(peer.relationship_id, sequence)
+            .map_err(|error| error.to_string())?;
+        Ok(sequence)
+    }
+
+    fn build_publication(
+        &self,
+        peer: &PeerRuntime,
+        kind: MessageKind,
+        id: RequestId,
+    ) -> Result<Publication, String> {
         let candidates = publication_endpoints(self.public.own_mappings(self.monotonic_ms))
             .into_iter()
             .map(|endpoint| RecordCandidate {
@@ -303,19 +360,23 @@ impl NodeFacts<'_> {
                 "no fresh measured STUN mapping; refusing an empty contact record".to_owned(),
             );
         }
-        let durable = self
-            .state
-            .load_sequence(peer.relationship_id)
-            .map_err(|error| error.to_string())?;
-        let highest_peer = peer.peer_cache.highest_seq().unwrap_or(0);
-        let sequence = reserve_sequence(durable, highest_peer, now_unix_us())
-            .map_err(|error| error.to_string())?;
-        self.state
-            .store_sequence(peer.relationship_id, sequence)
-            .map_err(|error| error.to_string())?;
-        let expires_at = self
-            .punch_offer_deadline
-            .unwrap_or_else(|| now.saturating_add(MAX_LIFETIME_MS));
+        let sequence = self.reserve_record_sequence(peer)?;
+        let (flags, _) = publication_validity(self.flags, self.punch_offer_deadline, now_unix_ms());
+        // A distinct higher sequence makes the alternative independently signed,
+        // never a rewrite of an already signed snapshot. Reserve before signing.
+        let fallback_sequence = if flags & FLAG_PUNCH_OFFER != 0 {
+            Some(self.reserve_record_sequence(peer)?)
+        } else {
+            None
+        };
+        // Durable storage may block: issue time and offer admission follow it.
+        let now = now_unix_ms();
+        let (flags, expires_at) = publication_validity(flags, self.punch_offer_deadline, now);
+        let sequence = if flags & FLAG_PUNCH_OFFER == 0 {
+            fallback_sequence.unwrap_or(sequence)
+        } else {
+            sequence
+        };
         let record = ContactRecord {
             relationship_id: peer.relationship_id,
             sender: self.self_key,
@@ -326,18 +387,31 @@ impl NodeFacts<'_> {
             boot_id: self.boot_id,
             generation: self.generation,
             candidates,
-            flags: self.flags,
+            flags,
         };
         // No publish queueing or signing happens before the durable reservation above.
         let payload = SignedPayload::sign(kind, id, &record, self.signing_key)
             .map_err(|error| error.to_string())?;
-        let handle = self
-            .ntfy_handle
-            .ok_or_else(|| "ntfy transport is not running".to_owned())?;
-        handle
-            .try_publish(peer.relationship_id, payload)
-            .map_err(|error| error.to_string())?;
-        Ok(expires_at)
+        let fallback = if flags & FLAG_PUNCH_OFFER != 0 {
+            let normal = ContactRecord {
+                record_seq: fallback_sequence.expect("offer alternative reserved before signing"),
+                flags: flags & !FLAG_PUNCH_OFFER,
+                expires_at_unix_ms: now.saturating_add(MAX_LIFETIME_MS),
+                ..record
+            };
+            Some(
+                SignedPayload::sign(kind, id, &normal, self.signing_key)
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        Ok(Publication {
+            payload,
+            fallback,
+            // Correlation remains valid for whichever alternative the actor sends.
+            expires_at_unix_ms: now.saturating_add(MAX_LIFETIME_MS),
+        })
     }
 
     /// Verify one payload against this relationship and release its candidates.
@@ -407,3 +481,6 @@ impl NodeFacts<'_> {
             .is_some_and(|snapshot| snapshot.currently_healthy)
     }
 }
+
+#[cfg(test)]
+mod tests;

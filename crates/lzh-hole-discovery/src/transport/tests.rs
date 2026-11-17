@@ -303,6 +303,83 @@ fn cached_replay_distinguishes_old_new_and_ambiguous_messages() {
 }
 
 #[test]
+fn offer_publish_margin_is_strict_without_changing_v1_receive_semantics() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    for remaining in [
+        28_366,
+        30_000,
+        MIN_PUNCH_OFFER_REMAINING_MS,
+        MIN_PUNCH_OFFER_REMAINING_MS + 1,
+    ] {
+        let mut record = signed(799).contact_record().unwrap();
+        record.flags = crate::record::FLAG_MAPPING_EDM | crate::record::FLAG_PUNCH_OFFER;
+        record.expires_at_unix_ms = NOW + remaining;
+        let payload = SignedPayload::sign(
+            MessageKind::Request,
+            RequestId::from_bytes([1; 16]),
+            &record,
+            &key,
+        )
+        .unwrap();
+        let original = payload.to_json().unwrap();
+        let admission = check_publish_fresh(&payload, UNIX_EPOCH + Duration::from_millis(NOW));
+        assert_eq!(admission.is_ok(), remaining > MIN_PUNCH_OFFER_REMAINING_MS);
+        if let Err(error) = admission {
+            assert!(matches!(error, NtfyError::PublishOfferUnavailable { .. }));
+            assert_eq!(error.operation(), NtfyOperation::Publish);
+        }
+        // The local publish guard is NOT a new wire/receive validity rule.
+        let policy = crate::peer_record::PeerRecordPolicy::new(
+            record.relationship_id,
+            record.receiver,
+            record.sender,
+            NOW,
+        );
+        assert!(payload.verify(&policy, None).is_ok());
+        assert_eq!(payload.to_json().unwrap(), original);
+        record.flags &= !crate::record::FLAG_PUNCH_OFFER;
+        let normal =
+            SignedPayload::sign(MessageKind::Request, payload.request_id(), &record, &key).unwrap();
+        assert!(check_publish_fresh(&normal, UNIX_EPOCH + Duration::from_millis(NOW)).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn final_transport_boundary_refuses_a_short_offer_without_http() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut record = signed(799).contact_record().unwrap();
+    record.flags = crate::record::FLAG_PUNCH_OFFER;
+    record.issued_at_unix_ms = now;
+    record.expires_at_unix_ms = now + MIN_PUNCH_OFFER_REMAINING_MS;
+    let payload = SignedPayload::sign(
+        MessageKind::Request,
+        RequestId::from_bytes([1; 16]),
+        &record,
+        &SigningKey::from_bytes(&[7; 32]),
+    )
+    .unwrap();
+    let config = NtfyConfig::new("https://example.com", "topic-1")
+        .unwrap()
+        .with_relationship(record.relationship_id)
+        .unwrap();
+    let result = publish(
+        &build_client(&config).unwrap(),
+        &config,
+        record.relationship_id,
+        &CancellationToken::new(),
+        &payload,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(NtfyError::PublishOfferUnavailable { .. })
+    ));
+}
+
+#[test]
 fn stale_signed_payload_is_refused_before_post_without_mutation() {
     let payload = signed(799);
     let expires = payload.expires_at_unix_ms().unwrap();

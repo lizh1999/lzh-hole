@@ -12,6 +12,10 @@ use crate::record::{ContactRecord, RecordCandidate};
 use crate::transport::NtfyResolver;
 
 fn signed() -> SignedPayload {
+    signed_as(MessageKind::Request, RequestId::from_bytes([0x12; 16]), 800)
+}
+
+fn signed_as(kind: MessageKind, id: RequestId, sequence: u64) -> SignedPayload {
     let sender = SigningKey::from_bytes(&[7; 32]);
     let receiver = SigningKey::from_bytes(&[8; 32]);
     let public = |key: &SigningKey| DiscoveryPublicKey::from_bytes(key.verifying_key().to_bytes());
@@ -19,7 +23,7 @@ fn signed() -> SignedPayload {
         relationship_id: RelationshipId::from_bytes([0x44; 16]),
         sender: public(&sender),
         receiver: public(&receiver),
-        record_seq: 800,
+        record_seq: sequence,
         issued_at_unix_ms: 1_800_000_000_000,
         expires_at_unix_ms: 1_800_000_600_000,
         boot_id: BootId::from_bytes([0x91; 16]),
@@ -30,13 +34,579 @@ fn signed() -> SignedPayload {
         }],
         flags: 0,
     };
-    SignedPayload::sign(
-        MessageKind::Request,
-        RequestId::from_bytes([0x12; 16]),
+    SignedPayload::sign(kind, id, &record, &sender).unwrap()
+}
+
+#[tokio::test]
+async fn latest_request_wins_without_merging_replies_or_other_relationships() {
+    let (mut transport, handle, mut events) = NtfyTransport::channel(multi_config(2), 8).unwrap();
+    let id = |byte| RequestId::from_bytes([byte; 16]);
+    let mut state = ActorState::new(&transport.config, 8, Instant::now());
+    handle
+        .try_publish(relationship(1), signed_as(MessageKind::Request, id(1), 801))
+        .unwrap();
+    transport.drain_commands(&mut state).await.unwrap();
+    handle
+        .try_publish(relationship(2), signed_as(MessageKind::Request, id(2), 802))
+        .unwrap();
+    handle
+        .try_publish(relationship(1), signed_as(MessageKind::Reply, id(3), 803))
+        .unwrap();
+    handle
+        .try_publish(relationship(1), signed_as(MessageKind::Request, id(4), 804))
+        .unwrap();
+    handle
+        .try_publish(relationship(1), signed_as(MessageKind::Request, id(5), 805))
+        .unwrap();
+    transport.drain_commands(&mut state).await.unwrap();
+    assert_eq!(
+        state
+            .pending
+            .iter()
+            .map(|command| command.payload.request_id())
+            .collect::<Vec<_>>(),
+        vec![id(2), id(3), id(5)]
+    );
+    for relationship in [relationship(1), relationship(2)] {
+        state
+            .scheduler
+            .note_subscribe_started(relationship, Instant::now());
+        state
+            .scheduler
+            .note_subscribed(relationship, Instant::now());
+        state.scheduler.note_announced(relationship, Instant::now());
+    }
+    assert_eq!(
+        state.ready_publishes(),
+        vec![relationship(2), relationship(1)]
+    );
+    let mut discarded = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let NtfyEvent::PublishFailed {
+            relationship: source,
+            kind,
+            request_id,
+            ..
+        } = event
+        {
+            assert_eq!(source, relationship(1));
+            assert_eq!(kind, MessageKind::Request);
+            discarded.push(request_id);
+        }
+    }
+    assert_eq!(discarded, vec![id(1), id(4)]);
+    assert_eq!(reserved_operations(&state), 0);
+    state.gate.note_start(Instant::now());
+    assert!(matches!(
+        next_host_operation(
+            &state.scheduler,
+            &state.gate,
+            &state.ready_publishes(),
+            None,
+            Instant::now()
+        )
+        .unwrap(),
+        NextOperation::Wait(_)
+    ));
+}
+
+#[tokio::test]
+async fn explicit_request_revocation_reaches_full_pending_and_channel_without_touching_reply() {
+    let (mut transport, handle, mut events) = NtfyTransport::channel(test_config(), 2).unwrap();
+    let id = signed().request_id();
+    let mut state = ActorState::new(&transport.config, 2, Instant::now());
+    handle.try_publish(relationship(1), signed()).unwrap();
+    handle
+        .try_publish(relationship(1), signed_as(MessageKind::Reply, id, 801))
+        .unwrap();
+    transport.drain_commands(&mut state).await.unwrap();
+    assert_eq!(state.pending.len(), 2);
+    handle.cancel_request(relationship(2), id);
+    handle.cancel_request(relationship(1), RequestId::from_bytes([99; 16]));
+    assert!(!state.pending[0].superseded.is_cancelled());
+    handle.cancel_request(relationship(1), id);
+    transport.drain_commands(&mut state).await.unwrap();
+    assert_eq!(state.pending.len(), 1);
+    assert_eq!(state.pending[0].payload.kind(), MessageKind::Reply);
+    assert!(
+        matches!(events.try_recv().unwrap(), NtfyEvent::PublishFailed { request_id, .. } if request_id == id)
+    );
+    handle.try_publish(relationship(1), signed()).unwrap();
+    handle.cancel_request(relationship(1), id);
+    transport.drain_commands(&mut state).await.unwrap();
+    assert_eq!(state.pending.len(), 1);
+    assert!(
+        matches!(events.try_recv().unwrap(), NtfyEvent::PublishFailed { request_id, .. } if request_id == id)
+    );
+    assert_eq!(reserved_operations(&state), 0);
+}
+
+#[tokio::test]
+async fn failed_replacement_does_not_revoke_the_admitted_request() {
+    let (mut transport, handle, _events) = NtfyTransport::channel(test_config(), 1).unwrap();
+    handle.try_publish(relationship(1), signed()).unwrap();
+    assert!(matches!(
+        handle.try_publish(
+            relationship(1),
+            signed_as(MessageKind::Request, RequestId::from_bytes([99; 16]), 801)
+        ),
+        Err(TryPublishError::Full)
+    ));
+    let mut state = ActorState::new(&transport.config, 1, Instant::now());
+    transport.drain_commands(&mut state).await.unwrap();
+    assert_eq!(state.pending.len(), 1);
+    assert!(!state.pending[0].superseded.is_cancelled());
+}
+
+fn offer_pair(kind: MessageKind, id: RequestId) -> (SignedPayload, SignedPayload) {
+    let mut record = signed_as(kind, id, 801).contact_record().unwrap();
+    record.flags = crate::record::FLAG_MAPPING_EDM | crate::record::FLAG_PUNCH_OFFER;
+    record.expires_at_unix_ms = record.issued_at_unix_ms + 120_000;
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let offer = SignedPayload::sign(kind, id, &record, &key).unwrap();
+    record.record_seq += 1;
+    record.flags &= !crate::record::FLAG_PUNCH_OFFER;
+    record.expires_at_unix_ms = record.issued_at_unix_ms + crate::record::MAX_LIFETIME_MS;
+    let normal = SignedPayload::sign(kind, id, &record, &key).unwrap();
+    (offer, normal)
+}
+
+#[tokio::test]
+async fn queued_offer_uses_only_its_pre_signed_normal_alternative_after_margin_expires() {
+    for kind in [MessageKind::Request, MessageKind::Reply] {
+        let (mut transport, handle, _events) = NtfyTransport::channel(test_config(), 4).unwrap();
+        let id = RequestId::from_bytes([1; 16]);
+        let (offer, normal) = offer_pair(kind, id);
+        let issue = offer.contact_record().unwrap().issued_at_unix_ms;
+        handle
+            .try_publish_with_fallback(relationship(1), offer.clone(), normal.clone())
+            .unwrap();
+        let mut state = ActorState::new(&transport.config, 4, Instant::now());
+        transport.drain_commands(&mut state).await.unwrap();
+        let command = &state.pending[0];
+        let wall = |elapsed| UNIX_EPOCH + Duration::from_millis(issue + elapsed);
+        assert_eq!(command.payload_for_publish(wall(0)).unwrap(), &offer);
+        assert_eq!(command.payload_for_publish(wall(59_999)).unwrap(), &offer);
+        assert_eq!(command.payload_for_publish(wall(60_000)).unwrap(), &normal);
+        assert_eq!(command.payload_for_publish(wall(120_000)).unwrap(), &normal);
+        assert!(
+            command
+                .payload_for_publish(wall(crate::record::MAX_LIFETIME_MS))
+                .is_err()
+        );
+        assert_eq!(command.payload, offer);
+        assert_eq!(normal.request_id(), id);
+        assert_eq!(normal.kind(), kind);
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "alternatives are one operation, not two queued POSTs"
+        );
+        assert_eq!(reserved_operations(&state), 0);
+    }
+}
+
+#[tokio::test]
+async fn closing_an_offer_preserves_reply_id_and_does_not_close_other_or_future_windows() {
+    let (mut transport, handle, _events) = NtfyTransport::channel(multi_config(2), 4).unwrap();
+    let id = RequestId::from_bytes([1; 16]);
+    let (offer, normal) = offer_pair(MessageKind::Reply, id);
+    let wall =
+        UNIX_EPOCH + Duration::from_millis(offer.contact_record().unwrap().issued_at_unix_ms);
+    handle
+        .try_publish_with_fallback(relationship(1), offer.clone(), normal.clone())
+        .unwrap();
+    handle
+        .try_publish_with_fallback(relationship(2), offer.clone(), normal.clone())
+        .unwrap();
+    let mut state = ActorState::new(&transport.config, 4, Instant::now());
+    transport.drain_commands(&mut state).await.unwrap();
+    handle.cancel_offers(relationship(1));
+    assert_eq!(state.pending[0].payload_for_publish(wall).unwrap(), &normal);
+    assert_eq!(state.pending[1].payload_for_publish(wall).unwrap(), &offer);
+    assert_eq!(
+        state.pending[0]
+            .payload_for_publish(wall)
+            .unwrap()
+            .request_id(),
+        id
+    );
+    handle
+        .try_publish_with_fallback(relationship(1), offer.clone(), normal)
+        .unwrap();
+    transport.drain_commands(&mut state).await.unwrap();
+    assert_eq!(state.pending[2].payload_for_publish(wall).unwrap(), &offer);
+    assert_eq!(state.pending.len(), 3, "replies are never coalesced");
+}
+
+#[tokio::test]
+async fn actor_refuses_short_offer_without_an_alternative_before_reserving_any_operation() {
+    let (mut transport, handle, mut events) = NtfyTransport::channel(test_config(), 4).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let (mut record, key) = (
+        signed().contact_record().unwrap(),
+        SigningKey::from_bytes(&[7; 32]),
+    );
+    record.issued_at_unix_ms = now;
+    record.expires_at_unix_ms = now + 28_366;
+    record.flags = crate::record::FLAG_PUNCH_OFFER;
+    let payload = SignedPayload::sign(
+        MessageKind::Reply,
+        RequestId::from_bytes([1; 16]),
         &record,
-        &sender,
+        &key,
     )
+    .unwrap();
+    handle
+        .try_publish(relationship(1), payload.clone())
+        .unwrap();
+    let mut state = ActorState::new(&transport.config, 4, Instant::now());
+    transport.drain_commands(&mut state).await.unwrap();
+    transport
+        .run_publish(&mut state, relationship(1))
+        .await
+        .unwrap();
+    assert!(state.pending.is_empty());
+    assert_eq!(reserved_operations(&state), 0);
+    let mut failed = false;
+    while let Ok(event) = events.try_recv() {
+        if let NtfyEvent::PublishFailed {
+            kind, request_id, ..
+        } = event
+        {
+            assert_eq!(kind, MessageKind::Reply);
+            assert_eq!(request_id, payload.request_id());
+            failed = true;
+        }
+    }
+    assert!(failed);
+}
+
+#[tokio::test]
+async fn no_offer_alternative_must_preserve_snapshot_correlation_and_advance_sequence() {
+    let (_transport, handle, _events) = NtfyTransport::channel(test_config(), 4).unwrap();
+    let id = RequestId::from_bytes([1; 16]);
+    let (offer, normal) = offer_pair(MessageKind::Request, id);
+    for (kind, new_id, sequence) in [
+        (MessageKind::Reply, id, 802),
+        (MessageKind::Request, RequestId::from_bytes([2; 16]), 802),
+        (MessageKind::Request, id, 801),
+    ] {
+        let mut record = normal.contact_record().unwrap();
+        record.record_seq = sequence;
+        let changed =
+            SignedPayload::sign(kind, new_id, &record, &SigningKey::from_bytes(&[7; 32])).unwrap();
+        assert!(
+            handle
+                .try_publish_with_fallback(relationship(1), offer.clone(), changed)
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn revocation_wakes_a_full_actor_queue_without_waiting_for_the_host_gate() {
+    let (mut transport, handle, mut events) = NtfyTransport::channel(test_config(), 1).unwrap();
+    handle.try_publish(relationship(1), signed()).unwrap();
+    let mut state = ActorState::new(&transport.config, 1, Instant::now());
+    transport.drain_commands(&mut state).await.unwrap();
+    // Consume the enqueue notification; cancellation must supply its own wake.
+    handle.changed.notified().await;
+    state.gate.note_start(Instant::now());
+    handle.cancel_request(relationship(1), signed().request_id());
+    let (_lines_tx, mut lines_rx) = mpsc::channel(1);
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        transport.wait_for_change(&mut state, &mut lines_rx, None),
+    )
+    .await
     .unwrap()
+    .unwrap();
+    transport.drain_commands(&mut state).await.unwrap();
+    assert!(state.pending.is_empty());
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        NtfyEvent::PublishFailed { .. }
+    ));
+    assert_eq!(reserved_operations(&state), 0);
+}
+
+#[derive(Debug)]
+struct RevokingPacingStore {
+    handle: Arc<Mutex<Option<NtfyHandle>>>,
+    relationship: RelationshipId,
+    request_id: RequestId,
+}
+
+impl NtfyPacingStore for RevokingPacingStore {
+    fn load(&mut self) -> Result<NtfyPacingLoad, String> {
+        Ok(NtfyPacingLoad::Missing)
+    }
+    fn save(&mut self, _snapshot: &[u8]) -> Result<(), String> {
+        self.handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cancel_request(self.relationship, self.request_id);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn revocation_during_durable_pacing_prevents_post_but_never_refunds_host_budget() {
+    let shared = Arc::new(Mutex::new(None));
+    let payload = signed();
+    let store = RevokingPacingStore {
+        handle: shared.clone(),
+        relationship: relationship(1),
+        request_id: payload.request_id(),
+    };
+    let (mut transport, handle, mut events) =
+        NtfyTransport::channel_with_pacing_store(test_config(), 4, Box::new(store)).unwrap();
+    *shared.lock().unwrap() = Some(handle.clone());
+    handle.try_publish(relationship(1), payload).unwrap();
+    let mut state = ActorState::new(&transport.config, 4, Instant::now());
+    transport.drain_commands(&mut state).await.unwrap();
+    // The store callback revokes after reservation but before any HTTP begins.
+    transport
+        .run_publish(&mut state, relationship(1))
+        .await
+        .unwrap();
+    assert!(state.pending.is_empty());
+    assert_eq!(reserved_operations(&state), 1);
+    assert!(state.gate.remaining(Instant::now()).unwrap() > Duration::from_secs(29));
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        NtfyEvent::PublishFailed { .. }
+    ));
+}
+
+async fn loopback_post_server(
+    status: u16,
+) -> (
+    u16,
+    tokio::task::JoinHandle<SignedPayload>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = posts.clone();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let (body_start, body_len) = loop {
+            let mut chunk = [0; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0);
+            bytes.extend_from_slice(&chunk[..read]);
+            assert!(bytes.len() <= 8192, "bounded test request");
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                assert!(headers.starts_with("POST /topic-1 HTTP/1.1\r\n"));
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                if bytes.len() >= end + 4 + length {
+                    break (end + 4, length);
+                }
+            }
+        };
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let payload = SignedPayload::from_json(
+            std::str::from_utf8(&bytes[body_start..body_start + body_len]).unwrap(),
+        )
+        .unwrap();
+        let response =
+            format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        socket.write_all(response.as_bytes()).await.unwrap();
+        payload
+    });
+    (port, task, posts)
+}
+
+#[tokio::test]
+async fn final_offer_threshold_crossing_posts_one_fallback_with_one_reservation() {
+    use crate::transport::publish_with_clock;
+    for kind in [MessageKind::Request, MessageKind::Reply] {
+        let (port, server, posts) = loopback_post_server(200).await;
+        let store = SharedPacingStore::default();
+        let (mut transport, handle, _events) = NtfyTransport::channel_with_pacing_store(
+            test_config().with_loopback_publish_url(port),
+            4,
+            Box::new(store.clone()),
+        )
+        .unwrap();
+        let (offer, normal) = offer_pair(kind, RequestId::from_bytes([1; 16]));
+        let issue = offer.contact_record().unwrap().issued_at_unix_ms;
+        handle
+            .try_publish_with_fallback(relationship(1), offer.clone(), normal.clone())
+            .unwrap();
+        let mut state = ActorState::new(&transport.config, 4, Instant::now());
+        transport.drain_commands(&mut state).await.unwrap();
+        transport
+            .reserve_operation(
+                &mut state.gate,
+                &mut state.budget,
+                NtfyOperation::Publish,
+                Some(relationship(1)),
+            )
+            .await
+            .unwrap();
+        let command = state.pending.pop_front().unwrap();
+        let wall = |elapsed| UNIX_EPOCH + Duration::from_millis(issue + elapsed);
+        // Reproduce the actor's last admission with 60,001 ms remaining.
+        let selected = command.payload_for_publish(wall(59_999)).unwrap();
+        assert_eq!(selected, &offer);
+        let times = std::cell::RefCell::new(VecDeque::from([
+            wall(59_999),
+            wall(60_000),
+            wall(60_000),
+            wall(60_000),
+        ]));
+        let calls = std::cell::Cell::new(0);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            publish_with_fallback(&command, selected, &transport.cancel, |payload| {
+                calls.set(calls.get() + 1);
+                publish_with_clock(
+                    &transport.client,
+                    &transport.config,
+                    relationship(1),
+                    &transport.cancel,
+                    payload,
+                    || {
+                        times
+                            .borrow_mut()
+                            .pop_front()
+                            .expect("only two admission checks per candidate")
+                    },
+                )
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let posted = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            posted, normal,
+            "signature, sequence, kind and request ID are unchanged"
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "first candidate refused before HTTP, one fallback candidate"
+        );
+        assert!(times.borrow().is_empty());
+        assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(reserved_operations(&state), 1);
+        assert_eq!(store.saves().len(), 1, "no second reservation or refund");
+    }
+}
+
+#[tokio::test]
+async fn a_started_http_failure_never_posts_the_fallback() {
+    let (port, server, posts) = loopback_post_server(500).await;
+    let store = SharedPacingStore::default();
+    let (mut transport, handle, mut events) = NtfyTransport::channel_with_pacing_store(
+        test_config().with_loopback_publish_url(port),
+        4,
+        Box::new(store.clone()),
+    )
+    .unwrap();
+    let (offer, normal) = offer_pair(MessageKind::Reply, RequestId::from_bytes([1; 16]));
+    handle
+        .try_publish_with_fallback(relationship(1), offer.clone(), normal)
+        .unwrap();
+    let mut state = ActorState::new(&transport.config, 4, Instant::now());
+    transport.drain_commands(&mut state).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        transport.run_publish(&mut state, relationship(1)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap(),
+        offer
+    );
+    assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(reserved_operations(&state), 1);
+    assert_eq!(store.saves().len(), 1);
+    assert!(state.pending.is_empty());
+    let mut failed = false;
+    while let Ok(event) = events.try_recv() {
+        if let NtfyEvent::PublishFailed {
+            kind,
+            request_id,
+            detail,
+            ..
+        } = event
+        {
+            assert_eq!(kind, offer.kind());
+            assert_eq!(request_id, offer.request_id());
+            assert!(detail.contains("HTTP 500"));
+            failed = true;
+        }
+    }
+    assert!(failed);
+}
+
+#[tokio::test]
+async fn cancellation_between_pre_http_rejection_and_fallback_prevents_post() {
+    for global in [false, true] {
+        let (mut transport, handle, _events) = NtfyTransport::channel(test_config(), 4).unwrap();
+        let (offer, normal) = offer_pair(MessageKind::Request, RequestId::from_bytes([1; 16]));
+        handle
+            .try_publish_with_fallback(relationship(1), offer.clone(), normal)
+            .unwrap();
+        let mut state = ActorState::new(&transport.config, 4, Instant::now());
+        transport.drain_commands(&mut state).await.unwrap();
+        let command = state.pending.pop_front().unwrap();
+        let mut calls = 0;
+        let result = publish_with_fallback(&command, &offer, &transport.cancel, |_| {
+            calls += 1;
+            if global {
+                transport.cancel.cancel();
+            } else {
+                command.superseded.cancel();
+            }
+            std::future::ready(Err(NtfyError::PublishOfferUnavailable {
+                kind: offer.kind(),
+                request_id: offer.request_id(),
+                expires_at_unix_ms: offer.expires_at_unix_ms().unwrap(),
+            }))
+        })
+        .await;
+        assert_eq!(calls, 1, "no fallback POST after cancellation");
+        if global {
+            assert!(matches!(result, Err(NtfyError::Cancelled)));
+        } else {
+            assert!(matches!(
+                result,
+                Err(NtfyError::PublishOfferUnavailable { .. })
+            ));
+        }
+    }
 }
 
 fn relationship(byte: u8) -> RelationshipId {
@@ -98,7 +668,7 @@ async fn disconnect_preserves_pending_payload_for_explicit_failure_handling() {
     handle.try_publish(relationship, payload).unwrap();
 
     let mut state = ActorState::new(&transport.config, 2, Instant::now());
-    transport.drain_commands(&mut state);
+    transport.drain_commands(&mut state).await.unwrap();
     assert_eq!(state.pending.len(), 1);
     // The payload is waiting for its host turn, so a disconnect cannot POST it.
     state.gate.note_start(Instant::now());
@@ -145,7 +715,7 @@ async fn response_headers_alone_do_not_enable_publishing() {
     handle.try_publish(relationship, signed()).unwrap();
 
     let mut state = ActorState::new(&transport.config, 4, Instant::now());
-    transport.drain_commands(&mut state);
+    transport.drain_commands(&mut state).await.unwrap();
     state
         .scheduler
         .note_subscribe_started(relationship, Instant::now());
@@ -195,7 +765,7 @@ async fn budget_failure_keeps_a_long_gate_after_the_stream_goes_idle() {
     let mut state = ActorState::new(&transport.config, 8, Instant::now());
     state.budget = OperationBudget::new(1);
     state.budget.reserve(Instant::now()).unwrap();
-    transport.drain_commands(&mut state);
+    transport.drain_commands(&mut state).await.unwrap();
     state
         .scheduler
         .note_subscribe_started(relationship, Instant::now());
@@ -841,7 +1411,7 @@ async fn a_failed_preflight_resolve_fails_the_publish_without_reserving_an_opera
     let (kind, request_id) = (payload.kind(), payload.request_id());
     handle.try_publish(relationship, payload).unwrap();
     let mut state = ActorState::new(&transport.config, 4, Instant::now());
-    transport.drain_commands(&mut state);
+    transport.drain_commands(&mut state).await.unwrap();
 
     transport
         .run_publish(&mut state, relationship)

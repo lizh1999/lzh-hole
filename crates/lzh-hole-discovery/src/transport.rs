@@ -26,6 +26,9 @@ pub const MAX_NTFY_LINE_BYTES: usize = 16 * 1024;
 pub const MAX_NTFY_TOPICS: usize = 8;
 pub(crate) const CONNECT_AND_HEADERS_TIMEOUT: Duration = Duration::from_secs(25);
 pub(crate) const PUBLISH_TIMEOUT: Duration = Duration::from_secs(25);
+/// Local admission margin: the easy scan (30 s), bounded POST (25 s), and
+/// parsing/scheduling slack (5 s). This is not a propagation-time guarantee.
+pub const MIN_PUNCH_OFFER_REMAINING_MS: u64 = 30_000 + PUBLISH_TIMEOUT.as_millis() as u64 + 5_000;
 const USER_AGENT: &str = "lzh-hole-ntfy/1";
 
 /// Validated ntfy connection settings. Production pacing cannot be lowered.
@@ -78,6 +81,12 @@ fn validate_topic(topic: &str) -> Result<(), NtfyError> {
 }
 
 impl NtfyConfig {
+    #[cfg(test)]
+    pub(crate) fn with_loopback_publish_url(mut self, port: u16) -> Self {
+        self.base_url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        self
+    }
+
     /// Use an HTTPS ntfy base URL and an ASCII `[A-Za-z0-9_-]` topic (1..=64).
     ///
     /// The topic is not bound to a relationship yet. Call
@@ -541,6 +550,18 @@ pub enum NtfyError {
         /// Original signed expiry; it is never extended in place.
         expires_at_unix_ms: u64,
     },
+    /// An offer cannot leave enough time for a full easy scan, or was revoked.
+    #[error(
+        "ntfy publish of {kind:?}/{request_id} has no usable punch window before {expires_at_unix_ms}"
+    )]
+    PublishOfferUnavailable {
+        /// Signed kind that will not be posted.
+        kind: MessageKind,
+        /// Original signed correlation.
+        request_id: RequestId,
+        /// Original hard deadline; never extended in place.
+        expires_at_unix_ms: u64,
+    },
     /// A non-success HTTP status. Retry-After is retained for the scheduler.
     #[error("ntfy {operation} returned HTTP {status}")]
     HttpStatus {
@@ -584,6 +605,9 @@ impl NtfyError {
             | NtfyError::Timeout { operation }
             | NtfyError::FakeIp { operation, .. }
             | NtfyError::HttpStatus { operation, .. } => *operation,
+            NtfyError::PublishExpired { .. } | NtfyError::PublishOfferUnavailable { .. } => {
+                NtfyOperation::Publish
+            }
             _ => NtfyOperation::Subscribe,
         }
     }
@@ -658,7 +682,28 @@ pub(crate) async fn publish(
     cancel: &CancellationToken,
     payload: &SignedPayload,
 ) -> Result<(), NtfyError> {
-    check_publish_fresh(payload, SystemTime::now())?;
+    publish_with_clock(
+        client,
+        config,
+        relationship,
+        cancel,
+        payload,
+        SystemTime::now,
+    )
+    .await
+}
+
+// The injected clock keeps the two pre-HTTP admission boundaries deterministic
+// in offline tests. Production always uses SystemTime::now via publish above.
+pub(crate) async fn publish_with_clock(
+    client: &reqwest::Client,
+    config: &NtfyConfig,
+    relationship: RelationshipId,
+    cancel: &CancellationToken,
+    payload: &SignedPayload,
+    mut now: impl FnMut() -> SystemTime,
+) -> Result<(), NtfyError> {
+    check_publish_fresh(payload, now())?;
     let body = payload
         .to_json()
         .map_err(|e| NtfyError::Protocol(e.to_string()))?;
@@ -668,6 +713,7 @@ pub(crate) async fn publish(
         .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .body(body);
+    check_publish_fresh(payload, now())?;
     let response = tokio::select! {
         _ = cancel.cancelled() => return Err(NtfyError::Cancelled),
         result = tokio::time::timeout(PUBLISH_TIMEOUT, request.send()) => {
@@ -719,9 +765,10 @@ pub(crate) fn check_publish_fresh(
     payload: &SignedPayload,
     now: SystemTime,
 ) -> Result<(), NtfyError> {
-    let expires_at_unix_ms = payload
-        .expires_at_unix_ms()
+    let record = payload
+        .contact_record()
         .map_err(|error| NtfyError::Protocol(error.to_string()))?;
+    let expires_at_unix_ms = record.expires_at_unix_ms;
     let now_ms = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -729,6 +776,15 @@ pub(crate) fn check_publish_fresh(
         .min(u64::MAX as u128) as u64;
     if now_ms >= expires_at_unix_ms {
         return Err(NtfyError::PublishExpired {
+            kind: payload.kind(),
+            request_id: payload.request_id(),
+            expires_at_unix_ms,
+        });
+    }
+    if record.flags & crate::record::FLAG_PUNCH_OFFER != 0
+        && expires_at_unix_ms <= now_ms.saturating_add(MIN_PUNCH_OFFER_REMAINING_MS)
+    {
+        return Err(NtfyError::PublishOfferUnavailable {
             kind: payload.kind(),
             request_id: payload.request_id(),
             expires_at_unix_ms,

@@ -2409,23 +2409,24 @@ mod tests {
         }
 
         // A window that is already nearly closed is not scanned.
-        {
+        for remaining in [0, 28_366, PUNCH_DEADLINE_MS] {
             let peer = mesh.daemon.peers.get_mut(&a).unwrap();
             peer.peer_record_flags |= lzh_hole_discovery::record::FLAG_PUNCH_OFFER;
-            peer.peer_record_expires_ms = NOW + PUNCH_DEADLINE_MS;
+            peer.peer_record_expires_ms = NOW + remaining;
+            mesh.daemon.maybe_start_punch(NOW);
+            assert!(
+                mesh.daemon.punch.is_none(),
+                "short window {remaining} is not scanned"
+            );
         }
-        mesh.daemon.maybe_start_punch(NOW);
-        assert!(
-            mesh.daemon.punch.is_none(),
-            "expired or nearly closed windows are not scanned"
-        );
 
-        // A live window is.
+        // A v1 peer needs only the existing >30 s receive-side scan margin;
+        // the newer sender's HTTP admission guard is not a wire requirement.
         mesh.daemon
             .peers
             .get_mut(&a)
             .unwrap()
-            .peer_record_expires_ms = NOW + 180_000;
+            .peer_record_expires_ms = NOW + PUNCH_DEADLINE_MS + 1;
         mesh.daemon.maybe_start_punch(NOW);
         let attempt = mesh
             .daemon

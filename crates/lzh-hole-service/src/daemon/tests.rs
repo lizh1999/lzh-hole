@@ -178,6 +178,50 @@ fn physical(name: &str, index: u32, ip: Ipv4Addr) -> InterfaceInfo {
     }
 }
 
+#[tokio::test]
+async fn discarded_publications_clear_only_the_matching_current_request() {
+    let (_temp, mut daemon) = offline_daemon();
+    let relationship = only(&daemon);
+    let old = RequestId::from_hex("11111111111111111111111111111111").unwrap();
+    let new = RequestId::from_hex("22222222222222222222222222222222").unwrap();
+    let now = now_unix_ms();
+    let mono = daemon.monotonic_ms();
+    let peer = peer_of_mut(&mut daemon);
+    peer.exchange.register_request(old).unwrap();
+    assert!(peer.public.request_started(old, now + 600_000, now, mono));
+    // Mapping/flag refresh revokes the old local and actor correlation.
+    daemon.refresh_public_requests();
+    assert!(peer_of(&daemon).public.pending_request().is_none());
+    let peer = peer_of_mut(&mut daemon);
+    assert!(!peer.exchange.cancel_request(old));
+    peer.exchange.register_request(new).unwrap();
+    assert!(peer.public.request_started(new, now + 600_000, now, mono));
+    for (kind, id) in [(MessageKind::Request, old), (MessageKind::Reply, new)] {
+        daemon
+            .handle_ntfy(NtfyEvent::PublishFailed {
+                relationship,
+                kind,
+                request_id: id,
+                detail: "obsolete queued publication".to_owned(),
+            })
+            .await;
+        assert_eq!(peer_of(&daemon).public.pending_request().unwrap().id, new);
+    }
+    daemon
+        .handle_ntfy(NtfyEvent::PublishFailed {
+            relationship,
+            kind: MessageKind::Request,
+            request_id: new,
+            detail: "discarded before POST".to_owned(),
+        })
+        .await;
+    let peer = peer_of_mut(&mut daemon);
+    assert!(peer.public.pending_request().is_none());
+    assert!(!peer.exchange.cancel_request(new));
+    assert!(!peer.public.request_due(mono));
+    assert!(peer.public.request_due(mono + 1_800_000));
+}
+
 pub(super) fn offline_daemon() -> (tempfile::TempDir, Daemon) {
     let temp = tempfile::tempdir().unwrap();
     let state = StateDir::open(&temp.path().join("state")).unwrap();

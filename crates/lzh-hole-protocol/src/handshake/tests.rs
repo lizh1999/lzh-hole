@@ -311,6 +311,79 @@ mod response_limit_tests {
     }
 
     #[test]
+    fn exhausted_hello_has_a_final_response_grace_and_rejects_retired_challenge() {
+        for late in [false, true] {
+            let (mut lo, mut hi) = engines();
+            let hello = frames(lo.start_attempt(ep(40002), 1_000).unwrap()).remove(0);
+            let challenge = frames(hi.handle_frame(&hello, ep(40001), 1_000)).remove(0);
+            for now in (2_000..=8_000).step_by(1_000) {
+                assert_eq!(frames(lo.tick(now)).len(), 1);
+            }
+            assert!(lo.tick(9_999).is_empty());
+            assert_eq!(lo.pending_attempts(), 1);
+            if late {
+                assert!(lo.tick(10_000).contains(&HandshakeEvent::AttemptExpired));
+                assert_eq!(lo.pending_attempts(), 0);
+                lo.start_attempt(ep(40002), 10_000).unwrap();
+                assert!(frames(lo.handle_frame(&challenge, ep(40002), 10_001)).is_empty());
+                assert!(lo.session().is_none());
+            } else {
+                let finish = frames(lo.handle_frame(&challenge, ep(40002), 9_999)).remove(0);
+                // Once selected, exhaustion cannot reopen the path competition.
+                lo.tick(12_000);
+                assert_eq!(lo.pending_attempts(), 1);
+                let ack = frames(hi.handle_frame(&finish, ep(40001), 12_000)).remove(0);
+                assert!(
+                    lo.handle_frame(&ack, ep(40002), 12_000)
+                        .iter()
+                        .any(|event| { matches!(event, HandshakeEvent::AckReceived { .. }) })
+                );
+                assert!(frames(lo.handle_frame(&challenge, ep(40002), 12_001)).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_on_two_paths_still_has_one_winner_and_rejects_old_transcripts() {
+        let (mut lo, mut hi) = engines();
+        let mut old_challenges = Vec::new();
+        for port in [40002, 40003] {
+            let hello = frames(lo.start_attempt(ep(port), 1_000).unwrap()).remove(0);
+            old_challenges.push((
+                port,
+                frames(hi.handle_frame(&hello, ep(40001), 1_000)).remove(0),
+            ));
+        }
+        for now in (2_000..=8_000).step_by(1_000) {
+            assert_eq!(frames(lo.tick(now)).len(), 2);
+        }
+        lo.tick(10_000);
+        assert_eq!(lo.pending_attempts(), 0);
+        let mut challenges = Vec::new();
+        for port in [40002, 40003] {
+            let hello = frames(lo.start_attempt(ep(port), 10_000).unwrap()).remove(0);
+            challenges.push((
+                port,
+                frames(hi.handle_frame(&hello, ep(40001), 10_000)).remove(0),
+            ));
+        }
+        let finish = frames(lo.handle_frame(&challenges[1].1, ep(40003), 10_000)).remove(0);
+        let winner = lo.session().unwrap().keys.session_id;
+        for (port, challenge) in old_challenges.iter().chain(challenges[..1].iter()) {
+            assert!(frames(lo.handle_frame(challenge, ep(*port), 10_001)).is_empty());
+            assert_eq!(lo.session().unwrap().keys.session_id, winner);
+            assert_eq!(lo.pending_attempts(), 1);
+        }
+        let ack = frames(hi.handle_frame(&finish, ep(40001), 10_000)).remove(0);
+        assert!(
+            lo.handle_frame(&ack, ep(40003), 10_000)
+                .iter()
+                .any(|event| matches!(event, HandshakeEvent::AckReceived { .. }))
+        );
+        assert_eq!(hi.session().unwrap().keys.session_id, winner);
+    }
+
+    #[test]
     fn responder_tick_never_invents_a_response() {
         let (mut lo, mut hi) = engines();
         let hello = frames(lo.start_attempt(ep(40002), 1_000).unwrap())

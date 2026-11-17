@@ -233,8 +233,13 @@ impl SignedPayload {
     /// Expiry inside the signed record, used to reject stale work before POST.
     /// This never extends or mutates the signed record.
     pub fn expires_at_unix_ms(&self) -> Result<u64, PayloadError> {
+        Ok(self.contact_record()?.expires_at_unix_ms)
+    }
+
+    // Local publish admission only. Received candidates MUST still use verify.
+    pub(crate) fn contact_record(&self) -> Result<ContactRecord, PayloadError> {
         let body = decode_hex_bounded(&self.record_body, MAX_RECORD_BODY_BYTES, "record body")?;
-        Ok(ContactRecord::decode_body(&body)?.expires_at_unix_ms)
+        Ok(ContactRecord::decode_body(&body)?)
     }
 
     /// Verify the signature and fully validate the record and its replay state.
